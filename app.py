@@ -37,9 +37,6 @@ if missing:
     st.error(f"Missing required secrets: {', '.join(missing)}")
     st.stop()
 
-# Optional: show a tiny status (no secrets revealed)
-st.sidebar.success("API keys loaded from Secrets ✅")
-
 import pandas as pd
 from datetime import datetime
 
