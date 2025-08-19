@@ -11,6 +11,14 @@ import get_relevant_solicitations as gs
 import find_relevant_suppliers as fs
 import generate_proposal as gp
 
+# at the top of app.py
+import streamlit as st, os
+APP_PW = st.secrets.get("APP_PASSWORD", "")
+if APP_PW:
+    pw = st.text_input("Enter access password", type="password")
+    if pw != APP_PW:
+        st.stop()  # don't render the app for wrong/blank password
+
 st.set_page_config(page_title="GovContract Assistant MVP", layout="wide")
 st.title("GovContract Assistant MVP")
 st.caption("A simple UI around your existing scripts for bid matching, suppliers, and proposal drafting.")
