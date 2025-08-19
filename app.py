@@ -1,5 +1,28 @@
-
 import streamlit as st
+
+APP_PW = st.secrets.get("APP_PASSWORD", "")
+
+def gate():
+    """Simple password gate that disappears after success."""
+    if not APP_PW:  # no password set -> no gate
+        return True
+
+    if "auth_ok" in st.session_state and st.session_state.auth_ok:
+        return True  # already authenticated this session
+
+    # Show input only until correct
+    pw = st.text_input("Enter access password", type="password")
+    if pw:  # user typed something
+        if pw.strip() == APP_PW.strip():
+            st.session_state.auth_ok = True
+            st.rerun()  # re-run to hide the box
+        else:
+            st.error("Wrong password")
+    st.stop()  # prevent rest of app from rendering until auth passes
+
+if not gate():
+    st.stop()
+
 import pandas as pd
 from datetime import datetime
 import os
@@ -10,14 +33,6 @@ sys.path.append('/mnt/data')
 import get_relevant_solicitations as gs
 import find_relevant_suppliers as fs
 import generate_proposal as gp
-
-# at the top of app.py
-import streamlit as st, os
-APP_PW = st.secrets.get("APP_PASSWORD", "")
-if APP_PW:
-    pw = st.text_input("Enter access password", type="password")
-    if pw != APP_PW:
-        st.stop()  # don't render the app for wrong/blank password
 
 st.set_page_config(page_title="GovContract Assistant MVP", layout="wide")
 st.title("GovContract Assistant MVP")
