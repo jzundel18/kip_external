@@ -1,31 +1,47 @@
+import os
 import streamlit as st
 
+# ----- Password gate (unchanged) -----
 APP_PW = st.secrets.get("APP_PASSWORD", "")
-
 def gate():
-    """Simple password gate that disappears after success."""
-    if not APP_PW:  # no password set -> no gate
+    if not APP_PW:
         return True
-
-    if "auth_ok" in st.session_state and st.session_state.auth_ok:
-        return True  # already authenticated this session
-
-    # Show input only until correct
+    if st.session_state.get("auth_ok"):
+        return True
     pw = st.text_input("Enter access password", type="password")
-    if pw:  # user typed something
-        if pw.strip() == APP_PW.strip():
-            st.session_state.auth_ok = True
-            st.rerun()  # re-run to hide the box
-        else:
-            st.error("Wrong password")
-    st.stop()  # prevent rest of app from rendering until auth passes
-
+    if pw and pw.strip() == APP_PW.strip():
+        st.session_state.auth_ok = True
+        st.rerun()
+    st.stop()
 if not gate():
     st.stop()
 
+# ----- Centralized secrets (keys) -----
+def get_secret(name, default=None):
+    # Prefer Streamlit secrets, then environment variables as fallback
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, default)
+
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+SERP_API_KEY   = get_secret("SERP_API_KEY")
+SAM_KEYS       = get_secret("SAM_KEYS", [])
+
+# Validate presence once at startup
+missing = [k for k,v in {
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "SERP_API_KEY": SERP_API_KEY,
+    "SAM_KEYS": SAM_KEYS,
+}.items() if not v]
+if missing:
+    st.error(f"Missing required secrets: {', '.join(missing)}")
+    st.stop()
+
+# Optional: show a tiny status (no secrets revealed)
+st.sidebar.success("API keys loaded from Secrets ✅")
+
 import pandas as pd
 from datetime import datetime
-import os
 
 # Import user modules
 import sys
@@ -49,10 +65,7 @@ if "sup_df" not in st.session_state:
     st.session_state.sup_df = None
 
 with st.sidebar:
-    st.subheader("API Keys")
-    openai_key = st.text_input("OpenAI API Key", type="password", help="Required for GPT filtering & proposal drafting")
-    sam_keys_raw = st.text_input("SAM.gov API Keys (comma-separated)", value="", help="Enter one or more SAM.gov API keys")
-    serp_key = st.text_input("SerpAPI Key (for Google search)", type="password")
+    st.success("✅ API keys loaded from Secrets")
     st.markdown("---")
     st.subheader("Tips")
     st.write("• Start with small limits (10–20) while testing.")
@@ -86,23 +99,24 @@ with tab1:
     col1, col2 = st.columns([1,1])
     with col1:
         if st.button("Fetch from SAM.gov", type="primary"):
-            if not openai_key:
-                st.error("Please provide your OpenAI API key in the sidebar.")
-            elif not sam_keys_raw.strip():
-                st.error("Please provide at least one SAM.gov API key in the sidebar.")
-            else:
-                target_keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-                api_keys = [k.strip() for k in sam_keys_raw.split(",") if k.strip()]
-                try:
-                    list_final = gs.get_relevant_solicitation_list(days_back, int(limit_results), api_keys, target_keywords, openai_key)
-                    df = list_to_df(list_final)
-                    if df.empty:
-                        st.warning("No solicitations returned with the current filters.")
-                    else:
-                        st.session_state.sol_df = df
-                        st.success(f"Fetched {len(df)} solicitations.")
-                except Exception as e:
-                    st.exception(e)
+            target_keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+            api_keys = SAM_KEYS  # from secrets
+            try:
+                list_final = gs.get_relevant_solicitation_list(
+                    days_back,
+                    int(limit_results),
+                    api_keys,
+                    target_keywords,
+                    OPENAI_API_KEY  # from secrets
+                )
+                df = list_to_df(list_final)
+                if df.empty:
+                    st.warning("No solicitations returned with the current filters.")
+                else:
+                    st.session_state.sol_df = df
+                    st.success(f"Fetched {len(df)} solicitations.")
+            except Exception as e:
+                st.exception(e)
 
     with col2:
         if uploaded_sol is not None:
@@ -133,15 +147,19 @@ with tab2:
         if st.button("Run supplier suggestion", type="primary"):
             if st.session_state.sol_df is None:
                 st.error("Load or fetch solicitations in Tab 1 first, or upload a sol_list.csv.")
-            elif not openai_key or not serp_key:
-                st.error("Please provide OpenAI & SerpAPI keys in the sidebar.")
             else:
                 sol_dicts = st.session_state.sol_df.to_dict(orient="records")
                 favored = [x.strip() for x in our_rec.split(",") if x.strip()]
                 not_favored = [x.strip() for x in our_not.split(",") if x.strip()]
                 try:
-                    results = fs.get_suppliers(sol_dicts, favored, not_favored, int(max_google), openai_key, serp_key)
-                    # get_suppliers likely returns a list of dicts
+                    results = fs.get_suppliers(
+                        solicitations=sol_dicts,
+                        our_recommended_suppliers=favored,
+                        our_not_recommended_suppliers=not_favored,
+                        Max_Google_Results=int(max_google),
+                        OpenAi_API_Key=OPENAI_API_KEY,   # from secrets
+                        Serp_API_Key=SERP_API_KEY        # from secrets
+                    )
                     sup_df = pd.DataFrame(results)
                     st.session_state.sup_df = sup_df
                     st.success(f"Generated {len(sup_df)} supplier rows.")
@@ -186,25 +204,27 @@ with tab3:
         idxs = st.multiselect("Pick rows to draft", options=list(range(len(st.session_state.sup_df))), help="Leave empty to draft all")
         run_btn = st.button("Generate proposal(s)", type="primary")
         if run_btn:
-            if not openai_key:
-                st.error("OpenAI API key required.")
-            else:
-                os.makedirs(out_dir, exist_ok=True)
-                try:
-                    if idxs:
-                        df = st.session_state.sup_df.iloc[idxs]
-                    else:
-                        df = st.session_state.sup_df
-                    gp.validate_supplier_and_write_proposal(df, out_dir, openai_key, bid_template, solinfo_template)
-                    st.success(f"Drafted proposals to {out_dir}.")
-                    # List created files
-                    files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir,f))]
-                    if files:
-                        st.write("Generated files:")
-                        for f in files:
-                            st.write(os.path.join(out_dir,f))
-                except Exception as e:
-                    st.exception(e)
+            os.makedirs(out_dir, exist_ok=True)
+            try:
+                if idxs:
+                    df = st.session_state.sup_df.iloc[idxs]
+                else:
+                    df = st.session_state.sup_df
+                gp.validate_supplier_and_write_proposal(
+                    df=df,
+                    output_directory=out_dir,
+                    Open_AI_API_Key=OPENAI_API_KEY,    # from secrets
+                    BID_TEMPLATE_FILE=bid_template,
+                    SOl_INFO_TEMPLATE=solinfo_template
+                )
+                st.success(f"Drafted proposals to {out_dir}.")
+                files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir,f))]
+                if files:
+                    st.write("Generated files:")
+                    for f in files:
+                        st.write(os.path.join(out_dir,f))
+            except Exception as e:
+                st.exception(e)
 
 st.markdown("---")
 st.caption("This is an MVP wrapper. When you're ready, we can replace CSVs with a database and add logins.")
