@@ -3,5 +3,7 @@ pandas
 requests
 openai>=1.0.0
 python-dotenv
-serpapi
 python-dateutil
+beautifulsoup4
+lxml
+python-docx
