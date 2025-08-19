@@ -1,0 +1,68 @@
+Solicitation Information:
+
+solicitation link: {link}
+
+posted date: {posted_date}
+due date: {due_date}
+
+solicitation title: {title}
+notice id: {notice_id}
+notice type: {notice_type}
+solicitation number: {solicitation_number}
+NAICS Code: {NAICS_code}
+
+item description: {description}
+item part #: {suggested_part_number}
+quantity: {quantity}
+listed supplier: {suggested_supplier}
+
+poc name: {poc_name}
+poc email: {poc_email}
+
+submission instructions: 
+{instructions}
+
+fulfillment instructions:
+{fulfillment_instructions}
+
+AI Suggested Suppliers:
+
+supplier 1: {supplier_1}
+supplier 1 rank: {supplier_1_rank}
+supplier 1 product #: {supplier_1_product_number}
+supplier 1 product name: {supplier_1_product_name}
+supplier 1 unit price: {supplier_1_unit_price}
+supplier 1 link: {supplier_1_link}
+
+
+supplier 2: {supplier_2}
+supplier 2 rank: {supplier_2_rank}
+supplier 2 product #: {supplier_2_product_number}
+supplier 2 product name: {supplier_2_product_name}
+supplier 2 unit price: {supplier_2_unit_price}
+supplier 2 link: {supplier_2_link}
+
+
+supplier 3: {supplier_3}
+supplier 3 rank: {supplier_3_rank}
+supplier 3 product #: {supplier_3_product_number}
+supplier 3 product name: {supplier_3_product_name}
+supplier 3 unit price: {supplier_3_unit_price}
+supplier 3 link: {supplier_3_link}
+
+
+To do before submission:
+- Verify that we have not missed the due date
+- Verify part meets requirements based on solicitation (Is there a specific part number/supplier required? Does our part match all required specifications?)
+- Verify supplier can meet quantity demands from solicitation
+- Verify unit price of item accounting for bulk quantity discounts
+- Determine part lead time and add to quote/proposal document.
+- Verify shipping address and add to quote/proposal document.
+- Determine shipping cost from supplier to government entity.
+- Determine total cost accounting for total cost for parts, shipping, and added margin/profit.
+- Add total price to quote/proposal document
+- Proof read quote/proposal document and verify that all information (part name/number, part description, etc) is correct.
+- Correct any formatting errors in quote/proposal document.
+- Follow submission instructions in solicitation to submit.
+
+

@@ -1,0 +1,120 @@
+Quote Submission – {solicitation_number} 
+
+Offered Item: {product_title} - {product_number}
+
+ 
+
+Contractor Information:
+
+Company Name: Kenai Defense Company, LLC 
+
+CAGE Code: 8N6S6 
+
+UEI Number: UT6RAV3ELCL3 
+
+Business Size: Small Business 
+
+Point of Contact: Jayden Zundel, Director of Program Development 
+
+Phone: (385) 412-3330 
+
+Email: jayden@kenaidefense.com 
+
+ 
+
+ 
+
+ 
+
+Technical Compliance 
+
+Kenai Defense offers the {product_title} - {product_number}, meeting all required salient characteristics: 
+
+{description} 
+
+ 
+
+Delivery Schedule & Destination 
+
+Kenai Defense confirms delivery of {quantity} - {product_title} in accordance with the following schedule: 
+
+ 
+
+Ship-To Address: 
+
+{Shipping_Address} 
+
+ 
+
+Delivery Schedule: 
+
+{quantity} – {Lead Time} ADO 
+
+All shipments FOB Destination. Packaging, marking, and freight are included. 
+
+ 
+
+Pricing (Firm-Fixed Price) 
+
+Quantity: {quantity}
+Unit Price: {price_ea}
+Total Price: {Total Price}
+
+ 
+
+ 
+
+Invoicing & Payment 
+
+Payment Terms: Net 30 Days after acceptance 
+
+Partial invoicing per CLIN is acceptable 
+
+ 
+
+Quality Assurance 
+
+Supplied new from authorized distribution 
+
+Conforms to NFPA 1977 and ANSI Z89.1 
+
+Certificates of Conformance provided 
+
+Lot traceability retained 
+
+ 
+
+Quote Validity 
+
+This quote is valid for 60 calendar days from submission. 
+
+ 
+
+Certification & Acceptance 
+
+Kenai Defense certifies the pricing above represents our best offer in response to Solicitation SPE1C125Q0418 and acknowledges the Government may award based on this quote without further discussion. 
+
+ 
+
+ 
+
+ 
+
+Submitted by: 
+
+Jayden Zundel 
+
+Director of Program Development 
+
+Kenai Defense Company, LLC 
+
+Phone: (385) 412-3330 
+
+Email: jayden@kenaidefense.com 
+
+
+ 
+
+Date: {Today}
+
+ 
