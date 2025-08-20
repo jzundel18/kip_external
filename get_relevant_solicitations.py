@@ -9,24 +9,23 @@ import itertools
 import time
 
 
-SAM_BASE_URL = "https://api.sam.gov/prod/opportunities/v2/search"
-
+SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 
 def _today_iso() -> str:
     """YYYY-MM-DD (SAM.gov expects date-only for postedFrom/postedTo)."""
     return date.today().isoformat()
 
+def _today_mmddyyyy() -> str:
+    return _mmddyyyy(date.today())
+
+def _mmddyyyy(d: date) -> str:
+    # returns e.g. "08/20/2025"
+    return d.strftime("%m/%d/%Y")
 
 def _iso_days_back(days_back: int) -> tuple[str, str]:
-    """
-    Return (postedFrom, postedTo) as YYYY-MM-DD.
-    days_back = 0 => today only
-    days_back = N => [today - N, today]
-    """
     today = date.today()
-    start = today - timedelta(days=days_back)
-    return (start.isoformat(), today.isoformat())
-
+    start = today - timedelta(days=max(0, int(days_back)))
+    return (_mmddyyyy(start), _mmddyyyy(today))
 
 def _pick_api_key(api_keys: List[str], attempt: int) -> Optional[str]:
     if not api_keys:
@@ -172,11 +171,26 @@ def get_sam_raw_v3(
     filtered = [r for r in raw_records if _match(r)]
     return filtered
 
+def get_raw_sam_solicitations(limit: int, api_keys: list[str]) -> list[dict]:
+    if not api_keys:
+        raise ValueError("No SAM.gov API keys provided")
+    api_key = api_keys[0]
 
-# Back-compat alias for your app code if you call this name somewhere else
-def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str, Any]]:
-    """Alias: today's raw records with limit=N (no extra filters)."""
-    return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
+    today = date.today()
+    posted_from = today.strftime("%m/%d/%Y")
+    posted_to   = today.strftime("%m/%d/%Y")
+
+    url = SAM_BASE_URL  # now "https://api.sam.gov/opportunities/v2/search"
+    params = {
+        "api_key": api_key,
+        "limit": int(limit),
+        "postedFrom": posted_from,
+        "postedTo": posted_to,
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("opportunitiesData", []) or data.get("data", [])
 
 
 # --------- Optional: minimal table mapping for old UI paths ---------
