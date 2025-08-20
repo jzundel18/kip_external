@@ -116,9 +116,6 @@ else:
 
 # Single authoritative connectivity check
 try:
-    parsed = make_url(DB_URL)
-    st.sidebar.write("DB host:", parsed.host)
-    st.sidebar.write("DB user:", parsed.username)
     with engine.connect() as conn:
         ver = conn.execute(sa.text("select version()")).first()
     st.sidebar.success("✅ Connected to database")
