@@ -1,310 +1,338 @@
-import requests
-import openai
-from datetime import datetime, timedelta, timezone
-from bs4 import BeautifulSoup
-import pandas as pd
-from http import HTTPStatus
-from requests.exceptions import HTTPError
-import json
+# get_relevant_solicitations.py
+#
+# UI-driven fetch of SAM.gov opportunities.
+# - Pushes filters from the UI directly into the SAM.gov API query.
+# - Optional AI downselect based on a short company description.
+# - Returns list-of-lists: [header, *rows] to match your app's existing expectations.
+#
+# Dependencies: requests, pandas, openai (>=1.0), python-dateutil (for date parsing if needed)
+
+from __future__ import annotations
 import re
+import json
+from typing import List, Dict, Any, Tuple, Optional
+import requests
+import pandas as pd
+from datetime import datetime, timedelta, timezone
+from openai import OpenAI
 
-# SAM.gov Search Details
-SAM_API_ENDPOINT = "https://api.sam.gov/opportunities/v2/search"
 
-key_choice = 0 #List has two options, starting with first one.
+# ------------------------------
+# Public entry points
+# ------------------------------
 
-# === Step 1: Search SAM.gov ===
-def fetch_sam_solicitations(days_back, sample_size, api_keys):
-    key_choice = 0
+def get_relevant_solicitations_v2(
+    days_back: int,
+    limit: int,
+    api_keys: List[str],
+    filters: Dict[str, Any],
+    openai_api_key: str
+) -> List[List[Any]]:
+    """
+    UI-driven fetch:
+      - Pulls from SAM.gov once using the provided filters (no redundant client-side filtering).
+      - Optional AI downselect if filters['use_ai_downselect'] is True.
+    Returns:
+      List-of-lists where first element is header, followed by data rows.
+    """
+    if not api_keys:
+        return []
+
+    # Build base params from UI filters
+    params = _build_sam_params(days_back, limit, filters)
+
+    # Fetch (try keys in order; stop after first success)
+    records, last_err = _fetch_records_with_key_rotation(params, api_keys)
+    if records is None:
+        # surface the last error to the caller
+        raise last_err if last_err else RuntimeError("Failed to fetch SAM.gov records.")
+
+    # Convert SAM response records to your table (list-of-lists)
+    header, rows = _records_to_table(records)
+
+    # Optional AI downselect
+    if filters.get("use_ai_downselect") and filters.get("company_desc"):
+        rows = _ai_downselect_rows(
+            header=header,
+            rows=rows,
+            company_desc=str(filters.get("company_desc") or ""),
+            openai_api_key=openai_api_key
+        )
+
+    return [header] + rows
+
+
+# ---- Backward-compat wrapper (keeps older app code working if anything still calls this) ----
+def get_relevant_solicitation_list(
+    Days_back: int,
+    N_SAM_results: int,
+    Api_Keys: List[str],
+    target_keywords: List[str],
+    OpenAi_API_Key: str
+) -> List[List[Any]]:
+    """
+    Legacy signature used by older UI code.
+    Maps to v2 with keywords only. No AI downselect here.
+    """
+    filters = {
+        "keywords_or": target_keywords or [],
+        "naics": [],
+        "set_asides": [],
+        "agency_contains": "",
+        "due_before": None,
+        "notice_types": [],
+        "use_ai_downselect": False,
+        "company_desc": "",
+    }
+    return get_relevant_solicitations_v2(
+        days_back=int(Days_back),
+        limit=int(N_SAM_results),
+        api_keys=Api_Keys or [],
+        filters=filters,
+        openai_api_key=OpenAi_API_Key or ""
+    )
+
+
+# ------------------------------
+# SAM.gov query + conversion
+# ------------------------------
+
+def _build_sam_params(days_back: int, limit: int, filters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Translate UI filters to SAM.gov search parameters (Opportunities v2).
+    NOTE: SAM parameters can vary by endpoint/version. These names are commonly supported.
+    Adjust the names to match the exact endpoint you’re using if needed.
+    """
     posted_to = datetime.now(timezone.utc).date()
     posted_from = posted_to - timedelta(days=days_back)
 
-    posted_to_str = posted_to.strftime("%m/%d/%Y")
-    posted_from_str = posted_from.strftime("%m/%d/%Y")
+    p = {
+        # Date range filter (MM/DD/YYYY)
+        "postedFrom": posted_from.strftime("%m/%d/%Y"),
+        "postedTo": posted_to.strftime("%m/%d/%Y"),
+        # Sorting & pagination
+        "sort": "-modifiedDate",
+        "limit": max(1, min(int(limit), 200)),
+        "offset": 0,
+    }
 
-    print(f"🔍 Querying most recent soliciations from SAM.gov")
-    try:
-        params = {
-            "api_key": api_keys[key_choice],
-            "postedFrom": posted_from_str,
-            "postedTo": posted_to_str,
-            "sort": "date",
-            "limit": sample_size
-        }
-        response = requests.get(SAM_API_ENDPOINT, params=params)
-        response.raise_for_status()
-    except HTTPError as exc:
-        if response.status_code == 404:
-            print("⚠️ Error: Failed to Receive Response from SAM.gov")
-            return []
+    # Keywords OR (space-separated generally acts like OR in SAM's 'q')
+    kws = [k for k in (filters.get("keywords_or") or []) if k]
+    if kws:
+        p["q"] = " ".join(kws)
 
-        if response.status_code == 429:
-            print("⚠️ Error: Usage rate exceeded on API key")
-            if key_choice == 0:
-                print("🔄 Switching API Key")
-                key_choice = 1
-            try:
-                params = {
-                    "api_key": api_keys[key_choice],
-                    "postedFrom": posted_from_str,
-                    "postedTo": posted_to_str,
-                    "sort": "date",
-                    "limit": sample_size
-                }
-                response = requests.get(SAM_API_ENDPOINT, params=params)
-                response.raise_for_status()
-            except HTTPError as exc:
-                if response.status_code == 404:
-                    print("⚠️ Error: Failed to Receive Response from SAM.gov")
-                    return []
-                if response.status_code == 429:
-                    print("⚠️ Error: Usage rate exceeded on API keys, exiting...")
-                    return []
+    # NAICS (comma-separated list)
+    naics = filters.get("naics") or []
+    if naics:
+        p["naics"] = ",".join([_digits_only(x) for x in naics if x])
 
-    data = response.json()
-    return data.get("opportunitiesData", [])
+    # Set-aside codes (examples: SB, WOSB, EDWOSB, HUBZone, SDVOSB, 8A, SDB)
+    sas = filters.get("set_asides") or []
+    if sas:
+        p["setAsideCode"] = ",".join(sas)
 
+    # Notice types (examples differ—map your UI choices to API values if necessary)
+    nts = filters.get("notice_types") or []
+    if nts:
+        p["noticeType"] = ",".join(nts)
 
-#=====Sept 2: Build Solicitation Library with Descriptions=======
-def build_solicitation_list(solicitations, api_keys):
-    sol_list = []
-    key_choice = 0
-    for sol in solicitations:
-        notice_id = sol.get("noticeId")
-        notice_type = sol.get("type")
-        number = sol.get("solicitationNumber")
-        naics_code = sol.get("naicsCode")
-        posted_date = sol.get("postedDate")
-        due_date = sol.get("responseDeadLine")
-        title = sol.get("title", "No title")
-        pocs = sol.get("pointOfContact")
+    # Agency/department (broad substring — not perfect; adjust/remove if your endpoint doesn't support)
+    agency_contains = (filters.get("agency_contains") or "").strip()
+    if agency_contains:
+        p["department"] = agency_contains
 
-        if pocs is not None:
-            primary_contact = next((contact for contact in pocs if contact['type'] == 'primary'), None)
-            if primary_contact:
-                poc_email = primary_contact['email']
-                poc_name = primary_contact['fullName']
+    # Due date upper bound
+    due_before = filters.get("due_before")
+    if due_before:
+        # Expecting ISO date string "YYYY-MM-DD" from UI
+        try:
+            dt = datetime.fromisoformat(str(due_before))
+            p["responseDateTo"] = dt.strftime("%m/%d/%Y")
+        except Exception:
+            pass
 
-            else:
-                poc_email = "None"
-                poc_name = "None"
-        else:
-            poc_email = "None"
-            poc_name = "None"
-        ui_link = sol.get("uiLink")
-
-        if 'award' not in notice_type.lower():
-            description_found = True
-            try:
-                description_url = f"https://api.sam.gov/prod/opportunities/v1/noticedesc?noticeid={notice_id}&api_key={api_keys[key_choice]}"
-                response = requests.get(description_url)
-                response.raise_for_status()
-            except HTTPError as exc:
-                if response.status_code == 404:
-                    description_found = False
-                    continue
-                if response.status_code == 429:
-                    if key_choice == 0:
-                        print("🔄 Switching API Key")
-                        key_choice = 1
-                        try:
-                            description_url = f"https://api.sam.gov/prod/opportunities/v1/noticedesc?noticeid={notice_id}&api_key={api_keys[key_choice]}"
-                            response = requests.get(description_url)
-                            response.raise_for_status()
-                        except HTTPError as exc:
-                            print("⚠ Error: Usage rate exceeded on API keys...Moving On...")
-                            description_found = False
-                            continue
-
-            if description_found:
-                description_html = response.text
-                soup = BeautifulSoup(description_html, "html.parser")
-                description = soup.get_text()
-            else:
-                description = "None Available"
+    return p
 
 
-            sol_list.append({
-                "notice id": notice_id,
-                "notice type": notice_type,
-                "solicitation number": number,
-                "NAICS Code": naics_code,
-                "posted date": posted_date,
-                "due date": due_date,
-                "title": title,
-                "point of contact name": poc_name,
-                "point of contact email": poc_email,
-                "description": description,
-                "link": ui_link
-            })
-    return sol_list
+def _fetch_records_with_key_rotation(params: Dict[str, Any], api_keys: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Exception]]:
+    """
+    Try each SAM API key until one works (basic rotation / fallback).
+    Returns (records, last_exception).
+    """
+    base = "https://api.sam.gov/opportunities/v2/search"
+    headers = {"Accept": "application/json"}
 
-# === Step 3: Filter by Keyword in Page Text ===
-def filter_solicitations_by_keyword(sol_list, keywords):
-    filtered_list = []
-    print(f"\n🔍 Filtering {len(sol_list)} solicitations for keywords: \"{keywords}\"...\n")
+    last_err: Optional[Exception] = None
+    for key in api_keys:
+        try:
+            p = dict(params)
+            p["api_key"] = key
+            r = requests.get(base, params=p, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            # Different responses sometimes store the list differently
+            recs = data.get("opportunitiesData") or data.get("data") or []
+            return recs, None
+        except Exception as e:
+            last_err = e
+            continue
 
-    for word in keywords:
-        matched = []
-        for sol in sol_list:
-            notice_id = sol.get("notice id")
-            notice_type = sol.get("notice type")
-            number = sol.get("solicitation number")
-            naics_code = sol.get("NAICS Code")
-            posted_date = sol.get("posted date")
-            due_date = sol.get("due date")
-            title = sol.get("title", "No title")
-            poc_name = sol.get("point of contact name")
-            poc_email = sol.get("point of contact email")
-            ui_link = sol.get("link")
-            description = sol.get("description")
-        
-            if word.lower() in description.lower():
-                matched.append({
-                    "notice id": notice_id,
-                    "notice type": notice_type,
-                    "solicitation number": number,
-                    "NAICS Code": naics_code,
-                    "posted date": posted_date,
-                    "due date": due_date,
-                    "title": title,
-                    "point of contact name": poc_name,
-                    "point of contact email": poc_email,
-                    "description": description,
-                    "link": ui_link
-                })
-        sol_list = matched
-    filtered_list = matched
-        
-    return filtered_list
+    return None, last_err
 
-def extract_json(text):
-    # Remove optional markdown code fences if present
-    return re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
 
-# === Step 4: Use GPT-4 to assess and summarize each solicitation ===
-def gpt_filter_solicitations(solicitations, target_keywords, OpenAi_Api_Key):
-    client = openai.OpenAI(api_key=OpenAi_Api_Key)
-    filtered = []
-    list_final = []
-    print(f"\n🔍 Using AI to filter {len(solicitations)} solicitations.")
-    for sol in solicitations:
-        sol_text = f"""
-Title: {sol.get("title")}
-NAICS Code: {sol.get("NAICS Code")}
-Due Date: {sol.get("due date")}
-Description: {sol.get("description", "")}
-Solicitation #: {sol.get("solicitation number")}
-URL: {sol.get("link")}
-        """
+def _records_to_table(records: List[Dict[str, Any]]) -> Tuple[List[str], List[List[Any]]]:
+    """
+    Convert raw SAM.gov records into your app’s table shape (list-of-lists).
+    We keep column names consistent with what your CSV likely expects.
+    If a field doesn't exist, we leave it blank.
+    """
+    header = [
+        "notice id",
+        "notice type",
+        "solicitation number",
+        "title",
+        "posted date",
+        "due date",
+        "NAICS Code",
+        "set-aside",
+        "agency",
+        "solicitation link",
+        "item description",
+        # keep space for fields your downstream code might expect (safe to leave blank)
+        "submission instructions",
+        "fulfillment instructions",
+        "quantity",
+        "zip code",
+        "listed supplier",
+        "item part#",
+        "poc name",
+        "poc email",
+        "poc phone",
+    ]
+
+    rows: List[List[Any]] = []
+    for r in records:
+        # Safely pull common fields; fallback to empty string if not present
+        rows.append([
+            r.get("noticeId") or r.get("id") or "",
+            r.get("noticeType") or r.get("type") or "",
+            r.get("solicitationNumber") or r.get("solnum") or "",
+            r.get("title") or "",
+            r.get("postedDate") or r.get("publishDate") or "",
+            r.get("responseDate") or r.get("closeDate") or "",
+            r.get("naics") or r.get("naicsCode") or "",
+            r.get("setAside") or r.get("setAsideCode") or "",
+            r.get("department") or r.get("agency") or r.get("organizationName") or "",
+            r.get("url") or r.get("samLink") or "",
+            r.get("description") or r.get("synopsis") or "",
+            # The remaining are placeholders; fill if/when your endpoint includes them or you derive them
+            r.get("submissionInstructions") or "",
+            r.get("fulfillmentInstructions") or "",
+            r.get("quantity") or "",
+            r.get("zip") or r.get("zipcode") or "",
+            r.get("listedSupplier") or "",
+            r.get("partNumber") or "",
+            _first_poc_name(r) or "",
+            _first_poc_email(r) or "",
+            _first_poc_phone(r) or "",
+        ])
+
+    return header, rows
+
+
+# ------------------------------
+# Optional AI downselect
+# ------------------------------
+
+def _ai_downselect_rows(
+    header: List[str],
+    rows: List[List[Any]],
+    company_desc: str,
+    openai_api_key: str
+) -> List[List[Any]]:
+    """
+    Row-wise binary classification: keep vs drop based on short company description.
+    Fast + cheap: uses gpt-4o-mini by default. Adjust model if desired.
+    """
+    if not rows or not company_desc.strip():
+        return rows
+
+    client = OpenAI(api_key=openai_api_key)
+    # Precompute index map for quick access
+    idx = {col: i for i, col in enumerate(header)}
+    i_title = idx.get("title", 0)
+    i_desc = idx.get("item description", 0)
+
+    kept: List[List[Any]] = []
+    for row in rows:
+        title = str(row[i_title] if i_title < len(row) else "")
+        desc = str(row[i_desc] if i_desc < len(row) else "")
 
         prompt = f"""
-You are a government contracting assistant. Evaluate if this SAM.gov solicitation is a good fit.
+You are helping downselect government solicitations for a company.
 
-Only select active solicitations that not past the due date. The solicitation should specifically ask for a quote or RFQ, and the solicitation should be able to be fulfilled via a US domestic supplier.
+Company description:
+\"\"\"{company_desc.strip()}\"\"\"
 
-We are specifically looking for items that are goods and not services. The solicitation description should contain enough information that the product can be sourced online. The quantity required and detailed item description
-must be included.
+Opportunity:
+Title: {title}
+Description: {desc}
 
-Provide the following information obtained from the solicitation description below including:
-- Relevance (yes/no). The solicitation must meet the above requirements in order for a "yes" to be entered in this field. Be critical when determining relevance.
-- Detailed item description including any listed required specifications. If the solicitation description mentions an attached document that contains more infomration, mention that here. Information about the related item category that can be learned from the NAICS code should also be added here.
-- Quantity of items requested
-- Item Part Number if mentioned in the solicitation information below. This includes NSN numbers, part numbers, product numbers, etc. Be sure to include the entire name or number
-- Item Supplier if mentioned in the solicitation information below. Be sure to include the entire name or number.
-- Detailed submission instructions if available including any requirments for proposal submission.
-- Detailed fulfillment instructions. Include any product shipping deadlines, location where product should be shipped, and shipping address if available.
-
-Respond ONLY with raw JSON — do not wrap it in quotes or formatting code blocks. Do not include any commentary or explanations.
-
-Requested format:
-{{
-  "Relevance": "yes",
-  "Item Description": "Widget X for automotive repair that must match specifications Y and Z. More details can be found in document attached to the solicitation.",
-  "Quanity": "1500 units",
-  "Item Part #": "WX-1234",
-  "Listed Supplier": "Acme Corp",
-  "Submission Instructions": "Submit your proposal via email to bids@agency.gov by July 30, 2025 at 5 PM ET.",
-  "Fulfilment Instructions": "Items should be shipped to the DHS office at 1234 Walnut Ave. Newark, NJ 12345 by Sep 25, 2025.
-}}
-Here is the solicitation description:
-
-{sol_text}
-        """
+Question: Is this opportunity a good fit for the company given the description?
+Respond with a strict JSON object on one line: {{"keep": true/false}}
+        """.strip()
 
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
+                temperature=0
             )
-            result_raw = response.choices[0].message.content.strip()
-            result = extract_json(result_raw)
-            try:
-                result_AI=json.loads(result)
-                if "yes" in result.lower():
-                    if result_AI.get("Quantity") != "":
-                        filtered.append(result)
-                        list_final.append({
-                            "relevance": result_AI.get("Relevance"),
-                            "notice id": sol.get("notice id"),
-                            "notice type": sol.get("notice type"),
-                            "solicitation number": sol.get("solicitation number"),
-                            "NAICS Code": sol.get("NAICS Code"),
-                            "posted date": sol.get("posted date"),
-                            "due date": sol.get("due date"),
-                            "title": sol.get("title"),
-                            "poc name": sol.get("point of contact name"),
-                            "poc email": sol.get("point of contact email"),
-                            "item description": result_AI.get("Item Description"),
-                            "quantity": result_AI.get("Quantity"),
-                            "item part#": result_AI.get("Item Part #"),
-                            "listed supplier": result_AI.get("Listed Supplier"),
-                            "submission instructions": result_AI.get("Submission Instructions"),
-                            "fulfillment instructions": result_AI.get("Fulfilment Instructions"),
-                            "solicitation link": sol.get("link")
-                        })
-            except json.JSONDecodeError as e:
-                print("⚠ Invalid JSON:", e)
-                list_final = []
-                filtered = []
-        except Exception as e:
-            print(f"⚠️ GPT-3.5 error: {e}")
-    print(f"✅  Matched {len(list_final)} solicitations to Kenai Defense.")
-    return list_final, filtered
+            text = (resp.choices[0].message.content or "").strip()
+            m = re.search(r"\{.*\}", text, flags=re.S)
+            keep = True
+            if m:
+                data = json.loads(m.group(0))
+                keep = bool(data.get("keep", True))
+            if keep:
+                kept.append(row)
+        except Exception:
+            # Fail-open (keep) on any model/network error
+            kept.append(row)
 
-# ====Save List====
-def save_solicitation_list(list_final,filename):
-    if len(list_final) != 0:
-        # Convert to DataFrame and save to CSV
-        df = pd.DataFrame(list_final[0:], columns=list_final[0])
-        df.to_csv(f"{filename}.csv", index=False)
-        print(f"Results Saved {len(list_final)} solicitations to sol_list.csv")
+    return kept
 
-# === Main Runner ===
-def get_relevant_solicitation_list(Days_back, N_SAM_results, Api_Keys, target_keywords, OpenAi_API_Key):
-    raw_solicitations = fetch_sam_solicitations(Days_back, N_SAM_results, Api_Keys)
-    solicitations = build_solicitation_list(raw_solicitations, Api_Keys)
-    relevant_sols = filter_solicitations_by_keyword(solicitations, target_keywords)
-    list_final, filtered_summaries = gpt_filter_solicitations(relevant_sols, target_keywords, OpenAi_API_Key)
-    return list_final
 
-# =====Run Program =====
-if __name__ == "__main__":
-    
-    # === Configuration ===
-    # API Keys
-    OPENAI_API_KEY = "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"
-    #SAM_API_KEY = "2WWQnuvYVj7cI3qozS5xC0Y2SgGITC7NGWtmqebq"  # Mine
-    #SAM_API_KEY = "qV4oW8tKis4kinR7oXIBlnTDlJx9Tyf4Se8Tmmmx"    #Jayden's
-    API_KEYS = ["2WWQnuvYVj7cI3qozS5xC0Y2SgGITC7NGWtmqebq", "qV4oW8tKis4kinR7oXIBlnTDlJx9Tyf4Se8Tmmmx"]
+# ------------------------------
+# Small helpers
+# ------------------------------
 
-    # Search and Filter Parameters
-    KEYWORDS = ["rfq"]
-    DAYS_BACK = 30
-    LIMIT_RESULTS = 50
+def _digits_only(s: str) -> str:
+    return re.sub(r"[^\d]", "", str(s or ""))
 
-    # Output File Name
-    CSV_OUTPUT = "sol_list"
-    
-    relevant_sols = get_relevant_solicitation_list(DAYS_BACK, LIMIT_RESULTS, API_KEYS, KEYWORDS, OPENAI_API_KEY)
-    save_solicitation_list(relevant_sols, CSV_OUTPUT)
+def _first_poc_name(rec: Dict[str, Any]) -> str:
+    # Try common PoC shapes; adjust if your endpoint differs
+    # Some records include a list like "pointOfContact": [{"name":"...","email":"..."}]
+    poc = rec.get("pointOfContact") or rec.get("poc") or rec.get("contacts")
+    if isinstance(poc, list) and poc:
+        name = poc[0].get("name") or poc[0].get("fullName")
+        return name or ""
+    if isinstance(poc, dict):
+        return poc.get("name") or poc.get("fullName") or ""
+    return ""
+
+def _first_poc_email(rec: Dict[str, Any]) -> str:
+    poc = rec.get("pointOfContact") or rec.get("poc") or rec.get("contacts")
+    if isinstance(poc, list) and poc:
+        return poc[0].get("email") or ""
+    if isinstance(poc, dict):
+        return poc.get("email") or ""
+    return ""
+
+def _first_poc_phone(rec: Dict[str, Any]) -> str:
+    poc = rec.get("pointOfContact") or rec.get("poc") or rec.get("contacts")
+    if isinstance(poc, list) and poc:
+        return poc[0].get("phone") or poc[0].get("telephone") or ""
+    if isinstance(poc, dict):
+        return poc.get("phone") or poc.get("telephone") or ""
+    return ""

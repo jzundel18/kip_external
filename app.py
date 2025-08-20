@@ -1,5 +1,15 @@
 import os
 import streamlit as st
+import re
+from datetime import date
+
+def normalize_naics_input(text: str) -> list[str]:
+    if not text: return []
+    values = re.split(r"[,\s]+", text.strip())
+    return [v for v in (re.sub(r"[^\d]", "", x) for x in values) if v]
+
+def parse_keywords_or(text: str) -> list[str]:
+    return [k.strip() for k in text.split(",") if k.strip()]
 
 # ----- Password gate (unchanged) -----
 APP_PW = st.secrets.get("APP_PASSWORD", "")
@@ -73,38 +83,64 @@ tab1, tab2, tab3 = st.tabs(["1) Fetch Solicitations", "2) Supplier Suggestions",
 # ---------------- Tab 1 ----------------
 with tab1:
     st.header("Fetch Relevant Solicitations")
-    colA, colB, colC = st.columns(3)
+
+    colA, colB, colC, colD = st.columns([1,1,1,1])
     with colA:
         days_back = st.number_input("Days back", min_value=1, max_value=120, value=30)
     with colB:
-        limit_results = st.number_input("Max results", min_value=1, max_value=200, value=25)
+        limit_results = st.number_input("Max results", min_value=1, max_value=200, value=50)
     with colC:
-        keywords_raw = st.text_input("Filter keywords (comma-separated)", value="rfq, rfp, rfi")
+        keywords_raw = st.text_input("Filter keywords (OR, comma-separated)", value="rfq, rfp, rfi")
+    with colD:
+        naics_raw = st.text_input("Filter by NAICS (comma-separated)", value="")
+
+    with st.expander("More filters (optional)"):
+        col1, col2, col3, col4 = st.columns([1,1,1,1])
+        with col1:
+            set_asides = st.multiselect("Set-aside",
+                ["SB","WOSB","EDWOSB","HUBZone","SDVOSB","8A","SDB"])
+        with col2:
+            agency_contains = st.text_input("Agency contains", value="")
+        with col3:
+            due_before = st.date_input("Due before (optional)", value=None, format="YYYY-MM-DD")
+        with col4:
+            notice_types = st.multiselect("Notice types",
+                ["Solicitation","Combined Synopsis/Solicitation","Sources Sought","Special Notice","SRCSGT","RFI"])
+
+    st.subheader("Company profile (optional)")
+    company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
+    use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
 
     uploaded_sol = st.file_uploader("Or upload an existing sol_list.csv", type=["csv"], key="sol_upload")
 
     def list_to_df(list_final):
-        # list_final format appears to be: first element is headers, subsequent elements are rows
         if isinstance(list_final, list) and list_final and isinstance(list_final[0], list):
-            header = list_final[0]
-            rows = list_final[1:]
-            df = pd.DataFrame(rows, columns=header)
-            return df
-        # Otherwise try to coerce directly
+            header = list_final[0]; rows = list_final[1:]
+            return pd.DataFrame(rows, columns=header)
         return pd.DataFrame(list_final)
 
-    col1, col2 = st.columns([1,1])
-    with col1:
+    filters = {
+        "keywords_or": parse_keywords_or(keywords_raw),
+        "naics": normalize_naics_input(naics_raw),
+        "set_asides": set_asides,
+        "agency_contains": agency_contains.strip(),
+        "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
+        "notice_types": notice_types,
+        "use_ai_downselect": bool(use_ai_downselect),
+        "company_desc": company_desc.strip(),
+    }
+
+    col_fetch, col_upload = st.columns([1,1])
+    with col_fetch:
         if st.button("Fetch from SAM.gov", type="primary"):
-            target_keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
-            api_keys = SAM_KEYS  # from secrets
             try:
-                list_final = gs.get_relevant_solicitation_list(
-                    days_back,
-                    int(limit_results),
-                    api_keys,
-                    target_keywords,
-                    OPENAI_API_KEY  # from secrets
+                # NEW: single call that does fetch-side filtering only
+                list_final = gs.get_relevant_solicitations_v2(
+                    days_back=int(days_back),
+                    limit=int(limit_results),
+                    api_keys=SAM_KEYS,
+                    filters=filters,                 # <— pass UI filters
+                    openai_api_key=OPENAI_API_KEY    # used only if AI downselect is True
                 )
                 df = list_to_df(list_final)
                 if df.empty:
@@ -115,20 +151,24 @@ with tab1:
             except Exception as e:
                 st.exception(e)
 
-    with col2:
+    with col_upload:
         if uploaded_sol is not None:
             try:
                 df = pd.read_csv(uploaded_sol)
                 st.session_state.sol_df = df
-                st.success(f"Loaded {len(df)} solicitations from uploaded CSV.")
+                st.success(f"Loaded {len(df)} solicitations from CSV.")
             except Exception as e:
                 st.error(f"Failed to read CSV: {e}")
 
     if st.session_state.sol_df is not None:
         st.subheader("Solicitations")
         st.dataframe(st.session_state.sol_df, use_container_width=True)
-        st.download_button("Download as CSV", st.session_state.sol_df.to_csv(index=False).encode("utf-8"), file_name="sol_list.csv", mime="text/csv")
-
+        st.download_button(
+            "Download as CSV",
+            st.session_state.sol_df.to_csv(index=False).encode("utf-8"),
+            file_name="sol_list.csv",
+            mime="text/csv"
+        )
 # ---------------- Tab 2 ----------------
 with tab2:
     st.header("Find Supplier Suggestions")
