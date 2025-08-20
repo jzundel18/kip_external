@@ -5,24 +5,21 @@ from __future__ import annotations
 import requests
 from datetime import date, timedelta
 from typing import List, Dict, Any, Optional
-import itertools
 import time
 
-
+# Per the current SAM.gov v2 docs, production URL omits '/prod'
 SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 
-def _today_iso() -> str:
-    """YYYY-MM-DD (SAM.gov expects date-only for postedFrom/postedTo)."""
-    return date.today().isoformat()
-
-def _today_mmddyyyy() -> str:
-    return _mmddyyyy(date.today())
-
 def _mmddyyyy(d: date) -> str:
-    # returns e.g. "08/20/2025"
+    """Return 'MM/dd/YYYY' as required by SAM v2 for date params like postedFrom/postedTo."""
     return d.strftime("%m/%d/%Y")
 
-def _iso_days_back(days_back: int) -> tuple[str, str]:
+def _window_days_back(days_back: int) -> tuple[str, str]:
+    """
+    Return (postedFrom, postedTo) in 'MM/dd/YYYY'.
+    days_back = 0 => today only
+    days_back = N => [today - N, today]
+    """
     today = date.today()
     start = today - timedelta(days=max(0, int(days_back)))
     return (_mmddyyyy(start), _mmddyyyy(today))
@@ -31,7 +28,6 @@ def _pick_api_key(api_keys: List[str], attempt: int) -> Optional[str]:
     if not api_keys:
         return None
     return api_keys[attempt % len(api_keys)]
-
 
 def _request_sam(params: Dict[str, Any], api_keys: List[str], max_attempts: int = 3) -> Dict[str, Any]:
     """
@@ -47,11 +43,9 @@ def _request_sam(params: Dict[str, Any], api_keys: List[str], max_attempts: int 
             full_params = dict(params)
             full_params["api_key"] = key
             resp = requests.get(SAM_BASE_URL, params=full_params, timeout=30)
-            # If SAM returns non-2xx, raise for_status to capture the body
             resp.raise_for_status()
             return resp.json() or {}
         except requests.HTTPError as e:
-            # If quota or auth issue, rotate key on next attempt
             last_exc = e
             time.sleep(0.5)
             continue
@@ -59,11 +53,9 @@ def _request_sam(params: Dict[str, Any], api_keys: List[str], max_attempts: int 
             last_exc = e
             time.sleep(0.5)
             continue
-    # All attempts failed
     if last_exc:
         raise last_exc
     return {}
-
 
 def get_sam_raw_v3(
     days_back: int,
@@ -76,7 +68,7 @@ def get_sam_raw_v3(
 
     Args:
         days_back: 0 = only today; N = from (today - N) to today inclusive
-        limit: max results to request (SAM may cap per-request; we do a single call)
+        limit: max results to request (SAM caps per-request; we do a single call)
         api_keys: list of SAM.gov API keys; we rotate if a key fails
         filters: optional dict; server sends only date-range & limit, we apply the rest client-side:
             - "notice_types": List[str]  (e.g., ["Solicitation","Combined Synopsis/Solicitation"])
@@ -90,37 +82,35 @@ def get_sam_raw_v3(
         List of dicts — each dict is the **entire SAM.gov record** (no fields lost).
     """
     filters = filters or {}
-    posted_from, posted_to = _iso_days_back(max(0, int(days_back)))
+    posted_from, posted_to = _window_days_back(days_back)
 
-    # Only send minimal filters to SAM itself (date window + limit).
-    # You can pass "noticeType" to SAM, but it’s safer to filter client-side
-    # to avoid accidental rejections until your needs are clear.
     params = {
         "limit": int(limit),
-        "postedFrom": posted_from,
-        "postedTo": posted_to,
-        # "noticeType": ",".join(filters.get("notice_types", [])) if filters.get("notice_types") else None,
-        # (Uncomment above to filter on server by notice type if you prefer)
+        "postedFrom": posted_from,  # MM/dd/YYYY
+        "postedTo": posted_to,      # MM/dd/YYYY
+        # You may optionally add server-side filters here if desired:
+        # "ptype": "o,k,r,s",         # procurement types (comma-separated codes)
+        # "ncode": "541511",          # NAICS
+        # "typeOfSetAside": "SBA",    # one code at a time
+        # "organizationName": "Defense Logistics Agency",
+        # "rdlfrom": "08/01/2025",
+        # "rdlto":   "08/31/2025",
     }
-    # Remove Nones so they don't appear as "None" in the query string
-    params = {k: v for k, v in params.items() if v not in (None, "", [])}
+    # Remove empty params
+    params = {k: v for k, v in params.items() if v not in (None, "", [], {})}
 
     data = _request_sam(params, api_keys)
     raw_records = data.get("opportunitiesData") or data.get("data") or []
     if not raw_records:
         return []
 
-    # Client-side filtering (non-destructive): produce a filtered view
+    # Client-side filtering (non-destructive) to keep it simple & robust
     def _match(rec: Dict[str, Any]) -> bool:
         # notice types (OR contains match)
         nts = filters.get("notice_types") or []
         if nts:
-            # records sometimes use 'type' or 'noticeType'
             r_type = str(rec.get("noticeType") or rec.get("type") or "").lower()
-            if r_type:
-                if not any(nt.lower() in r_type for nt in nts):
-                    return False
-            else:
+            if not r_type or not any(nt.lower() in r_type for nt in nts):
                 return False
 
         # keywords OR on title + description
@@ -132,23 +122,18 @@ def get_sam_raw_v3(
             if not any(k in blob for k in kws):
                 return False
 
-        # NAICS (exact string match on common keys)
+        # NAICS exact
         naics_targets = [n for n in (filters.get("naics") or []) if n]
         if naics_targets:
             rec_naics = str(rec.get("naics") or rec.get("naicsCode") or "").strip()
-            if rec_naics and rec_naics not in naics_targets:
-                return False
-            if not rec_naics:
+            if not rec_naics or rec_naics not in naics_targets:
                 return False
 
-        # set-aside (contains match)
+        # set-aside
         sas = filters.get("set_asides") or []
         if sas:
             rec_sa = str(rec.get("setAside") or rec.get("setAsideCode") or "").lower()
-            if rec_sa:
-                if not any(sa.lower() in rec_sa for sa in sas):
-                    return False
-            else:
+            if not rec_sa or not any(sa.lower() in rec_sa for sa in sas):
                 return False
 
         # agency contains
@@ -158,43 +143,22 @@ def get_sam_raw_v3(
             if agency_sub not in agency:
                 return False
 
-        # due before
+        # due before (compare as text on YYYY-MM-DD prefix)
         due_before = filters.get("due_before")
         if due_before:
-            # rec may use responseDate or closeDate; compare as plain dates if possible
-            resp = (rec.get("responseDate") or rec.get("closeDate") or "")[:10]  # YYYY-MM-DD*
+            resp = (rec.get("responseDate") or rec.get("closeDate") or "")[:10]
             if resp and resp > str(due_before):
                 return False
 
         return True
 
-    filtered = [r for r in raw_records if _match(r)]
-    return filtered
+    return [r for r in raw_records if _match(r)]
 
-def get_raw_sam_solicitations(limit: int, api_keys: list[str]) -> list[dict]:
-    if not api_keys:
-        raise ValueError("No SAM.gov API keys provided")
-    api_key = api_keys[0]
+# Back-compat alias (today only)
+def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str, Any]]:
+    return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
 
-    today = date.today()
-    posted_from = today.strftime("%m/%d/%Y")
-    posted_to   = today.strftime("%m/%d/%Y")
-
-    url = SAM_BASE_URL  # now "https://api.sam.gov/opportunities/v2/search"
-    params = {
-        "api_key": api_key,
-        "limit": int(limit),
-        "postedFrom": posted_from,
-        "postedTo": posted_to,
-    }
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("opportunitiesData", []) or data.get("data", [])
-
-
-# --------- Optional: minimal table mapping for old UI paths ---------
-
+# Minimal mapping for old table UI (kept for compatibility)
 _TABLE_HEADER = [
     "notice id",
     "notice type",
@@ -210,7 +174,6 @@ _TABLE_HEADER = [
 ]
 
 def _map_record_to_row(rec: Dict[str, Any]) -> List[str]:
-    """Map a raw SAM record to the minimal table row used by the UI."""
     def g(*keys: str, default: str = "") -> str:
         for k in keys:
             v = rec.get(k)
@@ -232,7 +195,6 @@ def _map_record_to_row(rec: Dict[str, Any]) -> List[str]:
         g("description", "synopsis"),
     ]
 
-
 def get_relevant_solicitations_v2(
     days_back: int,
     limit: int,
@@ -240,12 +202,6 @@ def get_relevant_solicitations_v2(
     filters: Dict[str, Any],
     openai_api_key: Optional[str] = None,
 ) -> List[List[str]]:
-    """
-    Return a 2D list: [header_row, *data_rows], preserving your app's existing expectations.
-    Under the hood we fetch raw→filter client-side→map to the minimal table.
-
-    NOTE: We do not call OpenAI here; AI downselect can be layered in your app if desired.
-    """
     raw = get_sam_raw_v3(days_back=days_back, limit=limit, api_keys=api_keys, filters=filters)
     rows = [_map_record_to_row(r) for r in raw]
     return [_TABLE_HEADER, *rows]

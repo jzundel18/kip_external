@@ -1,17 +1,18 @@
 import os
 import re
-from typing import Optional
 import json
+from typing import Optional, List, Dict, Any
+
 import pandas as pd
 import sqlalchemy as sa
 import streamlit as st
-from datetime import date, datetime, timezone
-
+from datetime import date
 from sqlmodel import SQLModel, Field, Session, create_engine, select
+from sqlalchemy.engine.url import make_url
 
-# ---------------------------
-# Page & small helpers
-# ---------------------------
+# =========================
+# Streamlit page & helpers
+# =========================
 st.set_page_config(page_title="GovContract Assistant MVP", layout="wide")
 
 def normalize_naics_input(text: str) -> list[str]:
@@ -23,9 +24,9 @@ def normalize_naics_input(text: str) -> list[str]:
 def parse_keywords_or(text: str) -> list[str]:
     return [k.strip() for k in text.split(",") if k.strip()]
 
-# ---------------------------
+# =========================
 # Password gate
-# ---------------------------
+# =========================
 APP_PW = st.secrets.get("APP_PASSWORD", "")
 def gate():
     if not APP_PW:
@@ -40,9 +41,9 @@ def gate():
 if not gate():
     st.stop()
 
-# ---------------------------
-# Centralized secrets
-# ---------------------------
+# =========================
+# Secrets
+# =========================
 def get_secret(name, default=None):
     if name in st.secrets:
         return st.secrets[name]
@@ -52,9 +53,8 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 SERP_API_KEY   = get_secret("SERP_API_KEY")
 SAM_KEYS       = get_secret("SAM_KEYS", [])
 
-# Normalize SAM_KEYS so it's always a list
+# Normalize SAM_KEYS so it is always a list
 if isinstance(SAM_KEYS, str):
-    # support comma-separated string in secrets.toml
     SAM_KEYS = [k.strip() for k in SAM_KEYS.split(",") if k.strip()]
 elif not isinstance(SAM_KEYS, (list, tuple)):
     SAM_KEYS = []
@@ -68,11 +68,9 @@ if missing:
     st.error(f"Missing required secrets: {', '.join(missing)}")
     st.stop()
 
-import urllib.parse
-
-# ---------------------------
-# DB setup (SQLite by default; Supabase if provided)
-# ---------------------------
+# =========================
+# Database (Supabase or SQLite)
+# =========================
 DB_URL = st.secrets.get("SUPABASE_DB_URL") or "sqlite:///app.db"
 
 if DB_URL.startswith("postgresql+psycopg2://"):
@@ -91,46 +89,62 @@ if DB_URL.startswith("postgresql+psycopg2://"):
     )
 else:
     engine = create_engine(DB_URL, pool_pre_ping=True)
+
+# Single authoritative connectivity check
 try:
+    parsed = make_url(DB_URL)
+    st.sidebar.write("DB host:", parsed.host)
+    st.sidebar.write("DB user:", parsed.username)
     with engine.connect() as conn:
-        version = conn.execute(sa.text("select version()")).first()
-    st.sidebar.success("✅ Connected to Supabase Postgres (pooled)")
-    if version and isinstance(version, tuple):
-        st.sidebar.caption(version[0])
+        ver = conn.execute(sa.text("select version()")).first()
+    st.sidebar.success("✅ Connected to database")
+    if ver and isinstance(ver, tuple):
+        st.sidebar.caption(ver[0])
 except Exception as e:
     st.sidebar.error("❌ Database connection failed")
     st.sidebar.exception(e)
+    st.stop()
 
-from sqlmodel import Column, JSON
-
+# =========================
+# Model
+# =========================
 class SolicitationRaw(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
+
     id: Optional[int] = Field(default=None, primary_key=True)
     notice_id: str = Field(index=True)
-    raw: dict = Field(sa_column=Column(JSON))  # full record from SAM.gov
+    notice_type: Optional[str] = None
+    solicitation_number: Optional[str] = None
+    title: Optional[str] = None
+    posted_date: Optional[str] = Field(default=None, index=True)
+    due_date: Optional[str] = Field(default=None, index=True)
+    naics_code: Optional[str] = Field(default=None, index=True)
+    set_aside: Optional[str] = Field(default=None, index=True)
+    agency: Optional[str] = Field(default=None, index=True)
+    link: Optional[str] = None
+    description: Optional[str] = None
 
+    # Keep full SAM record as JSON text (works on SQLite & Postgres)
+    raw_json: Optional[str] = Field(default=None, sa_column=sa.Column(sa.Text))
+
+# Create table once connected
 try:
     SQLModel.metadata.create_all(engine)
 except Exception as e:
-    st.error(f"DB init error: {e}")
-# --- DB Connection Test ---
-try:
-    with engine.connect() as conn:
-        result = conn.execute(sa.text("SELECT version();"))
-        version = result.scalar_one()
-    st.sidebar.success(f"✅ Connected to database: {DB_URL}")
-    st.sidebar.caption(f"Postgres version: {version}")
-except Exception as e:
-    st.sidebar.error("❌ Database connection failed")
+    st.sidebar.error("DB init error while creating tables")
     st.sidebar.exception(e)
-# ---------------------------
-# Imports for your modules (repo-local)
-# ---------------------------
+    st.stop()
+
+# =========================
+# Import your modules
+# =========================
 import get_relevant_solicitations as gs
 import find_relevant_suppliers as fs
 import generate_proposal as gp
 
-# ----- Sidebar -----
+# =========================
+# Sidebar controls
+# =========================
 with st.sidebar:
     st.success("✅ API keys loaded from Secrets")
 
@@ -143,12 +157,13 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Tips")
-    st.write("• Start with small limits (100–500) while testing.")
+    st.write("• Start with moderate limits (100–500) while testing.")
+    st.write("• Use DB filters below; refresh only when needed.")
 
-# ---------------------------
-# Small DB helpers
-# ---------------------------
-def _table_to_df(rows):
+# =========================
+# DB helpers
+# =========================
+def _table_to_df(rows: List[SolicitationRaw]) -> pd.DataFrame:
     return pd.DataFrame([{
         "notice id": r.notice_id,
         "notice type": r.notice_type,
@@ -163,100 +178,120 @@ def _table_to_df(rows):
         "item description": r.description,
     } for r in rows])
 
-def export_db_to_sample_csv(path="sample_feed.csv"):
-    with Session(engine) as s:
-        rows = s.exec(select(SolicitationRaw)).all()
-    df = _table_to_df(rows)
-    df.to_csv(path, index=False)
-    return len(df)
+def upsert_raw_records(records: List[Dict[str, Any]]) -> int:
+    """
+    Map key fields for filtering/display and store full JSON as raw_json.
+    Upsert by notice_id.
+    """
+    if not records:
+        return 0
 
-def load_df_into_db(df: pd.DataFrame) -> int:
+    def g(obj: dict, *keys, default=""):
+        for k in keys:
+            if k in obj and obj[k] is not None:
+                return obj[k]
+        return default
+
     inserted = 0
-    required_cols = {
-        "notice id","notice type","solicitation number","title","posted date","due date",
-        "NAICS Code","set-aside","agency","solicitation link","item description"
-    }
-    missing_cols = required_cols - set(df.columns)
-    if missing_cols:
-        raise ValueError(f"Sample CSV missing required columns: {sorted(missing_cols)}")
-
     with Session(engine) as s:
-        for _, r in df.iterrows():
-            notice_id = str(r["notice id"]).strip()
+        for r in records:
+            notice_id = str(g(r, "noticeId", "id", default="")).strip()
             if not notice_id:
                 continue
-            exists = s.exec(
-                select(SolicitationRaw).where(SolicitationRaw.notice_id == notice_id)
-            ).first()
+
+            exists = s.exec(select(SolicitationRaw).where(SolicitationRaw.notice_id == notice_id)).first()
+
+            mapped = dict(
+                notice_id=notice_id,
+                notice_type=str(g(r, "noticeType", "type", default="") or ""),
+                solicitation_number=str(g(r, "solicitationNumber", "solnum", default="") or ""),
+                title=str(g(r, "title", default="") or ""),
+                posted_date=str(g(r, "postedDate", "publishDate", default="") or ""),
+                due_date=str(g(r, "responseDate", "closeDate", default="") or ""),
+                naics_code=str(g(r, "naics", "naicsCode", default="") or ""),
+                set_aside=str(g(r, "setAside", "setAsideCode", default="") or ""),
+                agency=str(g(r, "department", "agency", "organizationName", default="") or ""),
+                link=str(g(r, "url", "samLink", default="") or ""),
+                description=str(g(r, "description", "synopsis", default="") or ""),
+                raw_json=json.dumps(r),
+            )
 
             if not exists:
-                s.add(SolicitationRaw(
-                    notice_id=notice_id,
-                    notice_type=str(r.get("notice type","") or ""),
-                    solicitation_number=str(r.get("solicitation number","") or ""),
-                    title=str(r.get("title","") or ""),
-                    posted_date=str(r.get("posted date","") or ""),
-                    due_date=str(r.get("due date","") or ""),
-                    naics_code=str(r.get("NAICS Code","") or ""),
-                    set_aside=str(r.get("set-aside","") or ""),
-                    agency=str(r.get("agency","") or ""),
-                    link=str(r.get("solicitation link","") or ""),
-                    description=str(r.get("item description","") or ""),
-                ))
+                s.add(SolicitationRaw(**mapped))
                 inserted += 1
             else:
-                exists.notice_type = str(r.get("notice type","") or "")
-                exists.solicitation_number = str(r.get("solicitation number","") or "")
-                exists.title = str(r.get("title","") or "")
-                exists.posted_date = str(r.get("posted date","") or "")
-                exists.due_date = str(r.get("due date","") or "")
-                exists.naics_code = str(r.get("NAICS Code","") or "")
-                exists.set_aside = str(r.get("set-aside","") or "")
-                exists.agency = str(r.get("agency","") or "")
-                exists.link = str(r.get("solicitation link","") or "")
-                exists.description = str(r.get("item description","") or "")
+                for k, v in mapped.items():
+                    setattr(exists, k, v)
         s.commit()
     return inserted
 
-# ---------------------------
-# Refresh today's feed (Dev Mode aware)
-# ---------------------------
 def refresh_todays_feed(limit: int = 500) -> int:
-    results = gs.get_raw_sam_solicitations(limit=limit, api_keys=SAM_KEYS)
-
-    with Session(engine) as s:
-        inserted = 0
-        for r in results:
-            notice_id = r.get("noticeId")
-            if not notice_id:
-                continue
-            exists = s.exec(
-                select(SolicitationRaw).where(SolicitationRaw.notice_id == notice_id)
-            ).first()
-            if not exists:
-                s.add(SolicitationRaw(notice_id=notice_id, raw=r))
-                inserted += 1
-            else:
-                exists.raw = r
-        s.commit()
-    return inserted
+    """
+    Pull today's records from SAM.gov (limit=N) and upsert all fields (raw_json + mapped columns).
+    """
+    filters = {
+        "keywords_or": [],
+        "naics": [],
+        "set_asides": [],
+        "agency_contains": "",
+        "due_before": None,
+        "notice_types": [],
+    }
+    raw_records = gs.get_sam_raw_v3(days_back=0, limit=int(limit), api_keys=SAM_KEYS, filters=filters)
+    return upsert_raw_records(raw_records)
 
 def query_today_from_db(filters: dict) -> pd.DataFrame:
+    """
+    Query the DB (no SAM calls) and apply UI filters client-side on the mapped columns.
+    """
+    kws = [k.lower() for k in (filters.get("keywords_or") or []) if k]
+    naics = [re.sub(r"[^\d]", "", x) for x in (filters.get("naics") or []) if x]
+    sas = filters.get("set_asides") or []
+    agency_contains = (filters.get("agency_contains") or "").lower().strip()
+    due_before = filters.get("due_before")
+    notice_types = filters.get("notice_types") or []
+
     with Session(engine) as s:
-        rows = s.exec(select(SolicitationRaw)).all()
+        stmt = select(SolicitationRaw).where(sa.true())
 
-    # Flatten JSON for display
-    df = pd.json_normalize([r.raw for r in rows])
-    return df
-    
+        if naics:
+            stmt = stmt.where(SolicitationRaw.naics_code.in_(naics))
 
-# ---------------------------
-# Header & global controls
-# ---------------------------
+        if sas:
+            stmt = stmt.where(SolicitationRaw.set_aside.in_(sas))
+
+        if notice_types:
+            ors = [SolicitationRaw.notice_type.ilike(f"%{nt}%") for nt in notice_types]
+            stmt = stmt.where(sa.or_(*ors))
+
+        if agency_contains:
+            stmt = stmt.where(SolicitationRaw.agency.ilike(f"%{agency_contains}%"))
+
+        rows = s.exec(stmt).all()
+
+    df = _table_to_df(rows)
+    if df.empty:
+        return df
+
+    # Keywords OR (title + description)
+    if kws:
+        blob = (df["title"].fillna("") + " " + df["item description"].fillna("")).str.lower()
+        df = df[blob.apply(lambda t: any(k in t for k in kws))]
+
+    # Due before (parse as date)
+    if due_before and "due date" in df.columns:
+        dd = pd.to_datetime(df["due date"], errors="coerce", utc=True)
+        df = df[dd.dt.date <= pd.to_datetime(due_before).date()]
+
+    return df.reset_index(drop=True)
+
+# =========================
+# Header & top controls
+# =========================
 st.title("GovContract Assistant MVP")
-st.caption("A simple UI around your existing scripts for bid matching, suppliers, and proposal drafting.")
+st.caption("Bid matching, suppliers, and proposal drafting — backed by a persistent database.")
 
-st.info("This app pulls from SAM.gov into the database once, then all filters query the DB (no extra API calls).")
+st.info("Refresh pulls from SAM.gov once → everything else filters the local database (no extra API calls).")
 
 colR1, colR2, colR3 = st.columns([1,1,1])
 with colR1:
@@ -268,35 +303,18 @@ with colR1:
             st.exception(e)
 
 with colR2:
-    # Optional: show a quick count of rows currently in DB
+    # Show count of rows currently in DB (cross-version safe)
     with Session(engine) as s:
         res = s.exec(select(sa.func.count(SolicitationRaw.id)))
-        val = res.first()  # could be an int OR a 1-tuple depending on versions
-        if isinstance(val, tuple):
-            total = int(val[0]) if val else 0
-        elif val is None:
-            total = 0
-        else:
-            total = int(val)
-    st.metric("Rows in DB", f"{total}") 
+        val = res.first()
+        total = int(val[0]) if isinstance(val, tuple) else int(val or 0)
+    st.metric("Rows in DB", f"{total}")
 
 with colR3:
     if st.button("⬇️ Download entire DB as CSV"):
         with Session(engine) as s:
             rows = s.exec(select(SolicitationRaw)).all()
-        df_all = pd.DataFrame([{
-            "notice id": r.notice_id,
-            "notice type": r.notice_type,
-            "solicitation number": r.solicitation_number,
-            "title": r.title,
-            "posted date": r.posted_date,
-            "due date": r.due_date,
-            "NAICS Code": r.naics_code,
-            "set-aside": r.set_aside,
-            "agency": r.agency,
-            "solicitation link": r.link,
-            "item description": r.description,
-        } for r in rows])
+        df_all = _table_to_df(rows)
         if df_all.empty:
             st.warning("Database is empty.")
         else:
@@ -306,17 +324,18 @@ with colR3:
                 file_name="solicitations.csv",
                 mime="text/csv"
             )
-# ---------------------------
+
+# =========================
 # Session state
-# ---------------------------
+# =========================
 if "sol_df" not in st.session_state:
     st.session_state.sol_df = None
 if "sup_df" not in st.session_state:
     st.session_state.sup_df = None
 
-# ---------------------------
+# =========================
 # Tabs
-# ---------------------------
+# =========================
 tab1, tab2, tab3 = st.tabs(["1) Fetch Solicitations", "2) Supplier Suggestions", "3) Proposal Draft"])
 
 # ---- Tab 1
@@ -325,9 +344,10 @@ with tab1:
 
     colA, colB, colC, colD = st.columns([1, 1, 1, 1])
     with colA:
-        days_back = st.number_input("Days back", min_value=1, max_value=120, value=30)  # kept for future use
+        days_back = st.number_input("Days back", min_value=0, max_value=120, value=0,
+            help="Currently used only when fetching from SAM.gov; 0 = today.")
     with colB:
-        limit_results = st.number_input("Max results", min_value=1, max_value=200, value=50)  # kept for future use
+        limit_results = st.number_input("Max results (UI filter only)", min_value=1, max_value=2000, value=200)
     with colC:
         keywords_raw = st.text_input("Filter keywords (OR, comma-separated)", value="rfq, rfp, rfi")
     with colD:
@@ -348,8 +368,8 @@ with tab1:
             )
 
     st.subheader("Company profile (optional)")
-    company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
-    use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
+    company_desc = st.text_area("Brief company description (for AI downselect – disabled in this build)", value="", height=120)
+    use_ai_downselect = st.checkbox("Use AI to downselect based on description (coming soon)", value=False, disabled=True)
 
     filters = {
         "keywords_or": parse_keywords_or(keywords_raw),
@@ -358,15 +378,15 @@ with tab1:
         "agency_contains": agency_contains.strip(),
         "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
         "notice_types": notice_types,
-        "use_ai_downselect": bool(use_ai_downselect),
-        "company_desc": company_desc.strip(),
     }
 
     if st.button("Fetch from local DB (today's feed)", type="primary"):
         try:
             df = query_today_from_db(filters)
+            if limit_results and not df.empty:
+                df = df.head(int(limit_results))
             if df.empty:
-                st.warning("No solicitations match your filters in today's feed. Try adjusting filters or refresh today's feed.")
+                st.warning("No solicitations match your filters. Try adjusting filters or refresh today's feed.")
             else:
                 st.session_state.sol_df = df
                 st.success(f"Found {len(df)} solicitations.")
@@ -382,6 +402,18 @@ with tab1:
             file_name="sol_list.csv",
             mime="text/csv"
         )
+
+        # Optional: inspect raw JSON of a selected notice
+        ids = st.session_state.sol_df["notice id"].tolist()
+        pick = st.selectbox("Inspect raw JSON for notice id:", options=["(select)"] + ids)
+        if pick != "(select)":
+            with Session(engine) as s:
+                rec = s.exec(select(SolicitationRaw).where(SolicitationRaw.notice_id == pick)).first()
+            if rec and rec.raw_json:
+                try:
+                    st.json(json.loads(rec.raw_json))
+                except Exception:
+                    st.code(rec.raw_json)
 
 # ---- Tab 2
 with tab2:
@@ -427,8 +459,8 @@ with tab2:
 with tab3:
     st.header("Generate Proposal Draft")
     st.write("Select one or more supplier-suggestion rows and generate a proposal draft using your templates.")
-    bid_template = st.text_input("Bid template file path (DOCX)", value="/mnt/data/BID_TEMPLATE.docx")
-    solinfo_template = st.text_input("Solicitation info template (DOCX)", value="/mnt/data/SOLICITATION_INFO_TEMPLATE.docx")
+    bid_template = st.text_input("Bid template file path (DOCX or TXT)", value="/mnt/data/BID_TEMPLATE.docx")
+    solinfo_template = st.text_input("Solicitation info template (DOCX or TXT)", value="/mnt/data/SOLICITATION_INFO_TEMPLATE.docx")
     out_dir = st.text_input("Output directory", value="/mnt/data/proposals")
 
     uploaded_sup2 = st.file_uploader("Or upload supplier_suggestions.csv here", type=["csv"], key="sup_upload2")
@@ -468,4 +500,4 @@ with tab3:
                 st.exception(e)
 
 st.markdown("---")
-st.caption("This is an MVP wrapper. When you're ready, we can replace CSVs with a database and add logins.")
+st.caption("This MVP stores full SAM.gov records (raw_json) and exposes key filters on indexed columns.")
