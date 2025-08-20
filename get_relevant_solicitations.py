@@ -359,3 +359,29 @@ def get_sam_raw_v3(days_back: int, limit: int, api_keys: list[str], filters: dic
     if records is None and last_err:
         raise last_err
     return records or []
+
+import requests
+
+def get_raw_sam_solicitations(limit: int, api_keys: list[str]) -> list[dict]:
+    """
+    Pull raw SAM.gov solicitations (no filtering, just the full JSON).
+    Returns a list of dicts (one per solicitation).
+    """
+    if not api_keys:
+        raise ValueError("No SAM.gov API keys provided")
+    api_key = api_keys[0]   # rotate if you want, but for now just use the first
+
+    url = "https://api.sam.gov/prod/opportunities/v2/search"
+    params = {
+        "api_key": api_key,
+        "limit": limit,
+        "postedFrom": "2025-08-20T00:00:00Z",  # you can make this dynamic = today
+        "postedTo": "2025-08-20T23:59:59Z"
+    }
+
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Each solicitation is under "opportunitiesData"
+    return data.get("opportunitiesData", [])
