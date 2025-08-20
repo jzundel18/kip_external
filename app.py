@@ -304,10 +304,14 @@ with colR2:
     # Optional: show a quick count of rows currently in DB
     with Session(engine) as s:
         res = s.exec(select(sa.func.count(SolicitationRaw.id)))
-        row = res.first()   # returns (count,) or None
-        total = int(row[0]) if row else 0
-
-st.metric("Rows in DB", f"{total}")  
+        val = res.first()  # could be an int OR a 1-tuple depending on versions
+        if isinstance(val, tuple):
+            total = int(val[0]) if val else 0
+        elif val is None:
+            total = 0
+        else:
+            total = int(val)
+    st.metric("Rows in DB", f"{total}") 
 
 with colR3:
     if st.button("⬇️ Download entire DB as CSV"):
