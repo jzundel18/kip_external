@@ -336,3 +336,26 @@ def _first_poc_phone(rec: Dict[str, Any]) -> str:
     if isinstance(poc, dict):
         return poc.get("phone") or poc.get("telephone") or ""
     return ""
+
+# ---- NEW: raw fetch that returns every field SAM.gov gives us ----
+def get_sam_raw_v3(days_back: int, limit: int, api_keys: list[str], filters: dict) -> list[dict]:
+    """
+    Returns the raw list of opportunity records from SAM.gov (all fields).
+    No OpenAI, no downselection. Just raw JSON dicts as the API returns them.
+    """
+    if not api_keys:
+        return []
+    params = _build_sam_params(days_back, limit, filters)
+    records = []
+    last_err = None
+    for key in api_keys:
+        try:
+            data = _sam_search(key, params)
+            records = data.get("opportunitiesData") or data.get("data") or []
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if records is None and last_err:
+        raise last_err
+    return records or []

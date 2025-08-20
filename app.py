@@ -1,7 +1,7 @@
 import os
 import re
 from typing import Optional
-
+import json
 import pandas as pd
 import sqlalchemy as sa
 import streamlit as st
@@ -89,11 +89,23 @@ class SolicitationRaw(SQLModel, table=True):
     link: Optional[str] = None
     description: Optional[str] = None
 
+    # NEW: keep everything SAM returned (SQLite: TEXT; Postgres: TEXT; fine for both)
+    raw_json: Optional[str] = Field(default=None, sa_column=sa.Column(sa.Text))
+
 try:
     SQLModel.metadata.create_all(engine)
 except Exception as e:
     st.error(f"DB init error: {e}")
-
+# --- DB Connection Test ---
+try:
+    with engine.connect() as conn:
+        result = conn.execute(sa.text("SELECT version();"))
+        version = result.scalar_one()
+    st.sidebar.success(f"✅ Connected to database: {DB_URL}")
+    st.sidebar.caption(f"Postgres version: {version}")
+except Exception as e:
+    st.sidebar.error("❌ Database connection failed")
+    st.sidebar.exception(e)
 # ---------------------------
 # Imports for your modules (repo-local)
 # ---------------------------
