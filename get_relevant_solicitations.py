@@ -10,7 +10,7 @@ import time
 # Production v2 endpoint (per current docs)
 SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 
-# ---- Custom errors so the UI can show a friendly message ----
+# ---- Custom errors for friendly UI messages ----
 class SamQuotaError(Exception):
     pass
 
@@ -24,12 +24,10 @@ class SamBadRequestError(Exception):
 def _mmddyyyy(d: date) -> str:
     return d.strftime("%m/%d/%Y")
 
-
 def _window_days_back(days_back: int) -> tuple[str, str]:
     today = date.today()
     start = today - timedelta(days=max(0, int(days_back)))
     return (_mmddyyyy(start), _mmddyyyy(today))
-
 
 def _mask_key(k: str) -> str:
     if not k:
@@ -53,6 +51,7 @@ def _request_sam(params: Dict[str, Any], api_keys: List[str]) -> Dict[str, Any]:
             full_params["api_key"] = key
             resp = requests.get(SAM_BASE_URL, params=full_params, timeout=30)
 
+            # Try to extract a short message
             txt = ""
             try:
                 j = resp.json()
@@ -66,7 +65,7 @@ def _request_sam(params: Dict[str, Any], api_keys: List[str]) -> Dict[str, Any]:
                 continue
 
             if resp.status_code in (401, 403):
-                # Sometimes returns 403 for quota
+                # Sometimes returns 403 for quota issues
                 if any(s in (txt or "").lower() for s in ["exceeded", "limit", "quota"]):
                     errors.append(f"{_mask_key(key)} → {resp.status_code} quota/limit. {txt}")
                 else:
@@ -100,8 +99,8 @@ def get_sam_raw_v3(
     filters: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch **raw SAM.gov opportunity records** (all fields) for a date window.
-    We only send date window + limit to SAM; other filters apply client-side.
+    Fetch raw SAM.gov opportunity records for a date window.
+    Only date + limit are sent to the server; other filters can be applied client-side if you want.
     """
     filters = filters or {}
     posted_from, posted_to = _window_days_back(days_back)
@@ -117,7 +116,7 @@ def get_sam_raw_v3(
     if not raw_records:
         return []
 
-    # Client-side filtering
+    # Optional client-side filtering (kept simple)
     def _match(rec: Dict[str, Any]) -> bool:
         nts = filters.get("notice_types") or []
         if nts:
@@ -135,13 +134,13 @@ def get_sam_raw_v3(
 
         naics_targets = [n for n in (filters.get("naics") or []) if n]
         if naics_targets:
-            rec_naics = str(rec.get("naics") or rec.get("naicsCode") or "").strip()
+            rec_naics = str(rec.get("naicsCode") or rec.get("naics") or "").strip()
             if not rec_naics or rec_naics not in naics_targets:
                 return False
 
         sas = filters.get("set_asides") or []
         if sas:
-            rec_sa = str(rec.get("setAside") or rec.get("setAsideCode") or "").lower()
+            rec_sa = str(rec.get("setAsideCode") or rec.get("setAside") or "").lower()
             if not rec_sa or not any(sa.lower() in rec_sa for sa in sas):
                 return False
 
@@ -162,47 +161,60 @@ def get_sam_raw_v3(
     return [r for r in raw_records if _match(r)]
 
 
-# Back-compat alias (today only)
 def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str, Any]]:
+    """Back-compat alias: today's raw records with limit=N (no extra filters)."""
     return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
 
 
-# Minimal mapping for legacy table UI (kept for compatibility)
-_TABLE_HEADER = [
-    "notice id","notice type","solicitation number","title","posted date",
-    "due date","NAICS Code","set-aside","agency","solicitation link","item description",
-]
-
-def _map_record_to_row(rec: Dict[str, Any]) -> List[str]:
+# Helper: map ONE raw record -> ONLY the allowed fields you want to persist
+def map_record_allowed_fields(rec: Dict[str, Any]) -> Dict[str, Any]:
     def g(*keys: str, default: str = "") -> str:
         for k in keys:
             v = rec.get(k)
-            if v is not None:
+            if v is not None and v != "":
                 return str(v)
         return default
 
-    return [
-        g("noticeId", "id"),
-        g("noticeType", "type"),
-        g("solicitationNumber", "solnum"),
-        g("title"),
-        g("postedDate", "publishDate"),
-        g("responseDate", "closeDate"),
-        g("naics", "naicsCode"),
-        g("setAside", "setAsideCode"),
-        g("department", "agency", "organizationName"),
-        g("url", "samLink"),
-        g("description", "synopsis"),
-    ]
+    # Link: prefer links[0].href if present
+    link = ""
+    links = rec.get("links")
+    if isinstance(links, list) and links:
+        first = links[0]
+        if isinstance(first, dict):
+            link = str(first.get("href") or "")
+    if not link:
+        link = g("url", "samLink", default="")
 
+    # Place of performance
+    pop = rec.get("placeOfPerformance") or {}
+    place_city = ""
+    place_state = ""
+    place_country_code = ""
+    if isinstance(pop, dict):
+        place_city = str(pop.get("city") or "")
+        place_state = str(pop.get("state") or "")
+        place_country_code = str(pop.get("countryCode") or "")
 
-def get_relevant_solicitations_v2(
-    days_back: int,
-    limit: int,
-    api_keys: List[str],
-    filters: Dict[str, Any],
-    openai_api_key: Optional[str] = None,
-) -> List[List[str]]:
-    raw = get_sam_raw_v3(days_back=days_back, limit=limit, api_keys=api_keys, filters=filters)
-    rows = [_map_record_to_row(r) for r in raw]
-    return [_TABLE_HEADER, *rows]
+    return {
+        "notice_id":            g("noticeId", "id"),
+        "solicitation_number":  g("solicitationNumber"),
+        "title":                g("title"),
+        "notice_type":          g("noticeType", "type"),
+        "posted_date":          g("postedDate"),
+        "response_date":        g("responseDate", "closeDate"),
+        "archive_date":         g("archiveDate"),
+        "department":           g("department"),
+        "agency":               g("agency"),
+        "office":               g("office"),
+        "organization_name":    g("organizationName"),
+        "naics_code":           g("naicsCode", "naics"),
+        "naics_description":    g("naicsDescription"),
+        "classification_code":  g("classificationCode"),
+        "set_aside_code":       g("setAsideCode", "setAside"),
+        "set_aside_description":g("setAsideDescription"),
+        "description":          g("description", "synopsis"),
+        "link":                 link,
+        "place_city":           place_city,
+        "place_state":          place_state,
+        "place_country_code":   place_country_code,
+    }
