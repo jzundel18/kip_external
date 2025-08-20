@@ -250,66 +250,32 @@ with st.sidebar:
 # =========================
 # Upsert-only-new helpers
 # =========================
-ALLOWED_COLUMNS = [
-    "pulled_at","notice_id","solicitation_number","title","notice_type",
+COLS_TO_SAVE = [
+    "notice_id","solicitation_number","title","notice_type",
     "posted_date","response_date","archive_date",
-    "agency","organization_name",
-    "naics_code",
-    "set_aside_code",
-    "description","link",
+    "agency","organization_name","naics_code","set_aside_code",
+    "description","link"
 ]
 def insert_new_records_only(records) -> int:
-    """
-    Insert ONLY brand-new notices into Supabase (no updates).
-    - Uses ON CONFLICT (notice_id) DO NOTHING
-    - Does NOT send pulled_at; DB fills it with DEFAULT NOW()
-    Expects `records` to be a list[dict] from get_sam_raw_v3().
-    """
     if not records:
         return 0
 
     rows = []
     for r in records:
-        # map the SAM record to the exact columns we persist
-        m = gs.map_record_allowed_fields(r)
-
-        notice_id = (m.get("notice_id") or "").strip()
-        if not notice_id:
+        m = gs.map_record_allowed_fields(r)  # your mapper
+        nid = (m.get("notice_id") or "").strip()
+        if not nid:
             continue
-
-        rows.append({
-            "notice_id":            notice_id,
-            "solicitation_number":  m.get("solicitation_number") or "",
-            "title":                m.get("title") or "",
-            "notice_type":          m.get("notice_type") or "",
-            "posted_date":          m.get("posted_date") or "",
-            "response_date":        m.get("response_date") or "",
-            "archive_date":         m.get("archive_date") or "",
-            "agency":               m.get("agency") or "",
-            "organization_name":    m.get("organization_name") or "",
-            "naics_code":           m.get("naics_code") or "",
-            "set_aside_code":       m.get("set_aside_code") or "",
-            "description":          m.get("description") or "",
-            "link":                 m.get("link") or "",
-        })
+        rows.append({k: (m.get(k) or "") for k in COLS_TO_SAVE})
 
     if not rows:
         return 0
 
-    # executemany insert with ON CONFLICT DO NOTHING
-    sql = sa.text("""
+    sql = sa.text(f"""
         INSERT INTO solicitationraw (
-            notice_id, solicitation_number, title, notice_type,
-            posted_date, response_date, archive_date,
-            agency, organization_name,
-            naics_code, set_aside_code,
-            description, link
+            {", ".join(COLS_TO_SAVE)}
         ) VALUES (
-            :notice_id, :solicitation_number, :title, :notice_type,
-            :posted_date, :response_date, :archive_date,
-            :agency, :organization_name,
-            :naics_code, :set_aside_code,
-            :description, :link
+            {", ".join(":"+c for c in COLS_TO_SAVE)}
         )
         ON CONFLICT (notice_id) DO NOTHING
     """)
@@ -317,46 +283,50 @@ def insert_new_records_only(records) -> int:
     with engine.begin() as conn:
         conn.execute(sql, rows)  # bulk insert
 
-    # returns attempted inserts (conflicts are silently ignored)
     return len(rows)
+DISPLAY_COLS = [
+    "pulled_at","notice_id","solicitation_number","title","notice_type",
+    "posted_date","response_date","archive_date",
+    "agency","organization_name","naics_code","set_aside_code",
+    "description","link"
+]
 
 def query_filtered_df(filters: dict) -> pd.DataFrame:
-    """
-    Read from DB (only the kept columns) and apply light client-side filters.
-    """
-    cols = ALLOWED_COLUMNS  # show everything you store
-    col_list = ", ".join(cols)
     with engine.connect() as conn:
-        try:
-            df = pd.read_sql_query(f"SELECT {col_list} FROM solicitationraw", conn)
-        except Exception:
-            return pd.DataFrame(columns=cols)
+        df = pd.read_sql_query(f"SELECT {', '.join(DISPLAY_COLS)} FROM solicitationraw", conn)
 
     if df.empty:
         return df
 
-    # Filters
+    # keyword OR filter (guard for missing description/title just in case)
     kws = [k.lower() for k in (filters.get("keywords_or") or []) if k]
     if kws:
-        blob = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
+        title = df["title"].fillna("")
+        desc  = df["description"].fillna("")
+        blob = (title + " " + desc).str.lower()
         df = df[blob.apply(lambda t: any(k in t for k in kws))]
 
-    naics = [re.sub(r"[^\d]", "", x) for x in (filters.get("naics") or []) if x]
+    # NAICS filter
+    naics = [re.sub(r"[^\d]","", x) for x in (filters.get("naics") or []) if x]
     if naics:
         df = df[df["naics_code"].isin(naics)]
 
+    # set-aside filter
     sas = filters.get("set_asides") or []
     if sas:
         df = df[df["set_aside_code"].fillna("").str.lower().apply(lambda s: any(sa.lower() in s for sa in sas))]
 
+    # agency contains
     agency_contains = (filters.get("agency_contains") or "").strip().lower()
     if agency_contains:
         df = df[df["agency"].fillna("").str.lower().str.contains(agency_contains)]
 
-    notice_types = filters.get("notice_types") or []
-    if notice_types:
-        df = df[df["notice_type"].fillna("").str.lower().apply(lambda s: any(nt.lower() in s for nt in notice_types))]
+    # notice types
+    nts = filters.get("notice_types") or []
+    if nts:
+        df = df[df["notice_type"].fillna("").str.lower().apply(lambda s: any(nt.lower() in s for nt in nts))]
 
+    # due before
     due_before = filters.get("due_before")
     if due_before:
         dd = pd.to_datetime(df["response_date"], errors="coerce", utc=True)
