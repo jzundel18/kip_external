@@ -157,6 +157,7 @@ class SolicitationRaw(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    pulled_at: Optional[str] = Field(default=None, index=True)
     notice_id: str = Field(index=True, nullable=False, unique=True)
 
     solicitation_number: Optional[str] = None
@@ -167,24 +168,15 @@ class SolicitationRaw(SQLModel, table=True):
     response_date: Optional[str] = Field(default=None, index=True)
     archive_date: Optional[str] = Field(default=None, index=True)
 
-    department: Optional[str] = Field(default=None, index=True)
     agency: Optional[str] = Field(default=None, index=True)
-    office: Optional[str] = Field(default=None, index=True)
     organization_name: Optional[str] = Field(default=None, index=True)
 
     naics_code: Optional[str] = Field(default=None, index=True)
-    naics_description: Optional[str] = None
-    classification_code: Optional[str] = Field(default=None, index=True)
 
     set_aside_code: Optional[str] = Field(default=None, index=True)
-    set_aside_description: Optional[str] = None
 
     description: Optional[str] = None
     link: Optional[str] = None
-
-    place_city: Optional[str] = Field(default=None, index=True)
-    place_state: Optional[str] = Field(default=None, index=True)
-    place_country_code: Optional[str] = Field(default=None, index=True)
 
 # Create table
 # --- create base table defined by SQLModel ---
@@ -192,6 +184,7 @@ SQLModel.metadata.create_all(engine)
 
 # --- lightweight migration: ensure required columns & unique index exist ---
 REQUIRED_COLS = {
+    "pulled_at": "TEXT",
     "notice_id": "TEXT",
     "solicitation_number": "TEXT",
     "title": "TEXT",
@@ -199,20 +192,12 @@ REQUIRED_COLS = {
     "posted_date": "TEXT",
     "response_date": "TEXT",
     "archive_date": "TEXT",
-    "department": "TEXT",
     "agency": "TEXT",
-    "office": "TEXT",
     "organization_name": "TEXT",
     "naics_code": "TEXT",
-    "naics_description": "TEXT",
-    "classification_code": "TEXT",
     "set_aside_code": "TEXT",
-    "set_aside_description": "TEXT",
     "description": "TEXT",
     "link": "TEXT",
-    "place_city": "TEXT",
-    "place_state": "TEXT",
-    "place_country_code": "TEXT",
 }
 
 try:

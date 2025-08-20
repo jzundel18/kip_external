@@ -199,6 +199,7 @@ def map_record_allowed_fields(rec: Dict[str, Any]) -> Dict[str, Any]:
         place_country_code = _name_or_str(pop.get("countryCode"))
 
     return {
+        "pulled_at":            g("pulledAt"),
         "notice_id":            g("noticeId", "id"),
         "solicitation_number":  g("solicitationNumber"),
         "title":                g("title"),
@@ -206,18 +207,10 @@ def map_record_allowed_fields(rec: Dict[str, Any]) -> Dict[str, Any]:
         "posted_date":          g("postedDate"),
         "response_date":        g("responseDate", "closeDate"),
         "archive_date":         g("archiveDate"),
-        "department":           g("department"),
         "agency":               g("agency"),
-        "office":               g("office"),
         "organization_name":    g("organizationName"),
         "naics_code":           g("naicsCode", "naics"),
-        "naics_description":    g("naicsDescription"),
-        "classification_code":  g("classificationCode"),
         "set_aside_code":       g("setAsideCode", "setAside"),
-        "set_aside_description":g("setAsideDescription"),
         "description":          g("description", "synopsis"),
         "link":                 link,
-        "place_city":           place_city,
-        "place_state":          place_state,
-        "place_country_code":   place_country_code,
     }
