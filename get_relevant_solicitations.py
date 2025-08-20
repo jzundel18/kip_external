@@ -1,387 +1,237 @@
 # get_relevant_solicitations.py
-#
-# UI-driven fetch of SAM.gov opportunities.
-# - Pushes filters from the UI directly into the SAM.gov API query.
-# - Optional AI downselect based on a short company description.
-# - Returns list-of-lists: [header, *rows] to match your app's existing expectations.
-#
-# Dependencies: requests, pandas, openai (>=1.0), python-dateutil (for date parsing if needed)
+# Pulls raw SAM.gov opportunities (all fields) and provides a light mapping helper.
 
 from __future__ import annotations
-import re
-import json
-from typing import List, Dict, Any, Tuple, Optional
 import requests
-import pandas as pd
-from datetime import datetime, timedelta, timezone
-from openai import OpenAI
+from datetime import date, timedelta
+from typing import List, Dict, Any, Optional
+import itertools
+import time
 
 
-# ------------------------------
-# Public entry points
-# ------------------------------
+SAM_BASE_URL = "https://api.sam.gov/prod/opportunities/v2/search"
+
+
+def _today_iso() -> str:
+    """YYYY-MM-DD (SAM.gov expects date-only for postedFrom/postedTo)."""
+    return date.today().isoformat()
+
+
+def _iso_days_back(days_back: int) -> tuple[str, str]:
+    """
+    Return (postedFrom, postedTo) as YYYY-MM-DD.
+    days_back = 0 => today only
+    days_back = N => [today - N, today]
+    """
+    today = date.today()
+    start = today - timedelta(days=days_back)
+    return (start.isoformat(), today.isoformat())
+
+
+def _pick_api_key(api_keys: List[str], attempt: int) -> Optional[str]:
+    if not api_keys:
+        return None
+    return api_keys[attempt % len(api_keys)]
+
+
+def _request_sam(params: Dict[str, Any], api_keys: List[str], max_attempts: int = 3) -> Dict[str, Any]:
+    """
+    Make a single SAM.gov request with basic retry & key rotation.
+    Raises the last error if all attempts fail.
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        key = _pick_api_key(api_keys, attempt)
+        if not key:
+            raise ValueError("No SAM.gov API key provided.")
+        try:
+            full_params = dict(params)
+            full_params["api_key"] = key
+            resp = requests.get(SAM_BASE_URL, params=full_params, timeout=30)
+            # If SAM returns non-2xx, raise for_status to capture the body
+            resp.raise_for_status()
+            return resp.json() or {}
+        except requests.HTTPError as e:
+            # If quota or auth issue, rotate key on next attempt
+            last_exc = e
+            time.sleep(0.5)
+            continue
+        except requests.RequestException as e:
+            last_exc = e
+            time.sleep(0.5)
+            continue
+    # All attempts failed
+    if last_exc:
+        raise last_exc
+    return {}
+
+
+def get_sam_raw_v3(
+    days_back: int,
+    limit: int,
+    api_keys: List[str],
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch **raw SAM.gov opportunity records** (all fields) for a date window.
+
+    Args:
+        days_back: 0 = only today; N = from (today - N) to today inclusive
+        limit: max results to request (SAM may cap per-request; we do a single call)
+        api_keys: list of SAM.gov API keys; we rotate if a key fails
+        filters: optional dict; server sends only date-range & limit, we apply the rest client-side:
+            - "notice_types": List[str]  (e.g., ["Solicitation","Combined Synopsis/Solicitation"])
+            - "keywords_or": List[str]   (lowercased OR-match against title+description)
+            - "naics": List[str]         (strings, e.g., ["541511","541512"])
+            - "set_asides": List[str]    (strings)
+            - "agency_contains": str     (substring, case-insensitive)
+            - "due_before": str          (YYYY-MM-DD)
+
+    Returns:
+        List of dicts — each dict is the **entire SAM.gov record** (no fields lost).
+    """
+    filters = filters or {}
+    posted_from, posted_to = _iso_days_back(max(0, int(days_back)))
+
+    # Only send minimal filters to SAM itself (date window + limit).
+    # You can pass "noticeType" to SAM, but it’s safer to filter client-side
+    # to avoid accidental rejections until your needs are clear.
+    params = {
+        "limit": int(limit),
+        "postedFrom": posted_from,
+        "postedTo": posted_to,
+        # "noticeType": ",".join(filters.get("notice_types", [])) if filters.get("notice_types") else None,
+        # (Uncomment above to filter on server by notice type if you prefer)
+    }
+    # Remove Nones so they don't appear as "None" in the query string
+    params = {k: v for k, v in params.items() if v not in (None, "", [])}
+
+    data = _request_sam(params, api_keys)
+    raw_records = data.get("opportunitiesData") or data.get("data") or []
+    if not raw_records:
+        return []
+
+    # Client-side filtering (non-destructive): produce a filtered view
+    def _match(rec: Dict[str, Any]) -> bool:
+        # notice types (OR contains match)
+        nts = filters.get("notice_types") or []
+        if nts:
+            # records sometimes use 'type' or 'noticeType'
+            r_type = str(rec.get("noticeType") or rec.get("type") or "").lower()
+            if r_type:
+                if not any(nt.lower() in r_type for nt in nts):
+                    return False
+            else:
+                return False
+
+        # keywords OR on title + description
+        kws = [k.strip().lower() for k in (filters.get("keywords_or") or []) if k.strip()]
+        if kws:
+            title = str(rec.get("title") or "").lower()
+            desc = str(rec.get("description") or rec.get("synopsis") or "").lower()
+            blob = f"{title} {desc}"
+            if not any(k in blob for k in kws):
+                return False
+
+        # NAICS (exact string match on common keys)
+        naics_targets = [n for n in (filters.get("naics") or []) if n]
+        if naics_targets:
+            rec_naics = str(rec.get("naics") or rec.get("naicsCode") or "").strip()
+            if rec_naics and rec_naics not in naics_targets:
+                return False
+            if not rec_naics:
+                return False
+
+        # set-aside (contains match)
+        sas = filters.get("set_asides") or []
+        if sas:
+            rec_sa = str(rec.get("setAside") or rec.get("setAsideCode") or "").lower()
+            if rec_sa:
+                if not any(sa.lower() in rec_sa for sa in sas):
+                    return False
+            else:
+                return False
+
+        # agency contains
+        agency_sub = (filters.get("agency_contains") or "").strip().lower()
+        if agency_sub:
+            agency = str(rec.get("department") or rec.get("agency") or rec.get("organizationName") or "").lower()
+            if agency_sub not in agency:
+                return False
+
+        # due before
+        due_before = filters.get("due_before")
+        if due_before:
+            # rec may use responseDate or closeDate; compare as plain dates if possible
+            resp = (rec.get("responseDate") or rec.get("closeDate") or "")[:10]  # YYYY-MM-DD*
+            if resp and resp > str(due_before):
+                return False
+
+        return True
+
+    filtered = [r for r in raw_records if _match(r)]
+    return filtered
+
+
+# Back-compat alias for your app code if you call this name somewhere else
+def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str, Any]]:
+    """Alias: today's raw records with limit=N (no extra filters)."""
+    return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
+
+
+# --------- Optional: minimal table mapping for old UI paths ---------
+
+_TABLE_HEADER = [
+    "notice id",
+    "notice type",
+    "solicitation number",
+    "title",
+    "posted date",
+    "due date",
+    "NAICS Code",
+    "set-aside",
+    "agency",
+    "solicitation link",
+    "item description",
+]
+
+def _map_record_to_row(rec: Dict[str, Any]) -> List[str]:
+    """Map a raw SAM record to the minimal table row used by the UI."""
+    def g(*keys: str, default: str = "") -> str:
+        for k in keys:
+            v = rec.get(k)
+            if v is not None:
+                return str(v)
+        return default
+
+    return [
+        g("noticeId", "id"),
+        g("noticeType", "type"),
+        g("solicitationNumber", "solnum"),
+        g("title"),
+        g("postedDate", "publishDate"),
+        g("responseDate", "closeDate"),
+        g("naics", "naicsCode"),
+        g("setAside", "setAsideCode"),
+        g("department", "agency", "organizationName"),
+        g("url", "samLink"),
+        g("description", "synopsis"),
+    ]
+
 
 def get_relevant_solicitations_v2(
     days_back: int,
     limit: int,
     api_keys: List[str],
     filters: Dict[str, Any],
-    openai_api_key: str
-) -> List[List[Any]]:
+    openai_api_key: Optional[str] = None,
+) -> List[List[str]]:
     """
-    UI-driven fetch:
-      - Pulls from SAM.gov once using the provided filters (no redundant client-side filtering).
-      - Optional AI downselect if filters['use_ai_downselect'] is True.
-    Returns:
-      List-of-lists where first element is header, followed by data rows.
+    Return a 2D list: [header_row, *data_rows], preserving your app's existing expectations.
+    Under the hood we fetch raw→filter client-side→map to the minimal table.
+
+    NOTE: We do not call OpenAI here; AI downselect can be layered in your app if desired.
     """
-    if not api_keys:
-        return []
-
-    # Build base params from UI filters
-    params = _build_sam_params(days_back, limit, filters)
-
-    # Fetch (try keys in order; stop after first success)
-    records, last_err = _fetch_records_with_key_rotation(params, api_keys)
-    if records is None:
-        # surface the last error to the caller
-        raise last_err if last_err else RuntimeError("Failed to fetch SAM.gov records.")
-
-    # Convert SAM response records to your table (list-of-lists)
-    header, rows = _records_to_table(records)
-
-    # Optional AI downselect
-    if filters.get("use_ai_downselect") and filters.get("company_desc"):
-        rows = _ai_downselect_rows(
-            header=header,
-            rows=rows,
-            company_desc=str(filters.get("company_desc") or ""),
-            openai_api_key=openai_api_key
-        )
-
-    return [header] + rows
-
-
-# ---- Backward-compat wrapper (keeps older app code working if anything still calls this) ----
-def get_relevant_solicitation_list(
-    Days_back: int,
-    N_SAM_results: int,
-    Api_Keys: List[str],
-    target_keywords: List[str],
-    OpenAi_API_Key: str
-) -> List[List[Any]]:
-    """
-    Legacy signature used by older UI code.
-    Maps to v2 with keywords only. No AI downselect here.
-    """
-    filters = {
-        "keywords_or": target_keywords or [],
-        "naics": [],
-        "set_asides": [],
-        "agency_contains": "",
-        "due_before": None,
-        "notice_types": [],
-        "use_ai_downselect": False,
-        "company_desc": "",
-    }
-    return get_relevant_solicitations_v2(
-        days_back=int(Days_back),
-        limit=int(N_SAM_results),
-        api_keys=Api_Keys or [],
-        filters=filters,
-        openai_api_key=OpenAi_API_Key or ""
-    )
-
-
-# ------------------------------
-# SAM.gov query + conversion
-# ------------------------------
-
-def _build_sam_params(days_back: int, limit: int, filters: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Translate UI filters to SAM.gov search parameters (Opportunities v2).
-    NOTE: SAM parameters can vary by endpoint/version. These names are commonly supported.
-    Adjust the names to match the exact endpoint you’re using if needed.
-    """
-    posted_to = datetime.now(timezone.utc).date()
-    posted_from = posted_to - timedelta(days=days_back)
-
-    p = {
-        # Date range filter (MM/DD/YYYY)
-        "postedFrom": posted_from.strftime("%m/%d/%Y"),
-        "postedTo": posted_to.strftime("%m/%d/%Y"),
-        # Sorting & pagination
-        "sort": "-modifiedDate",
-        "limit": max(1, min(int(limit), 200)),
-        "offset": 0,
-    }
-
-    # Keywords OR (space-separated generally acts like OR in SAM's 'q')
-    kws = [k for k in (filters.get("keywords_or") or []) if k]
-    if kws:
-        p["q"] = " ".join(kws)
-
-    # NAICS (comma-separated list)
-    naics = filters.get("naics") or []
-    if naics:
-        p["naics"] = ",".join([_digits_only(x) for x in naics if x])
-
-    # Set-aside codes (examples: SB, WOSB, EDWOSB, HUBZone, SDVOSB, 8A, SDB)
-    sas = filters.get("set_asides") or []
-    if sas:
-        p["setAsideCode"] = ",".join(sas)
-
-    # Notice types (examples differ—map your UI choices to API values if necessary)
-    nts = filters.get("notice_types") or []
-    if nts:
-        p["noticeType"] = ",".join(nts)
-
-    # Agency/department (broad substring — not perfect; adjust/remove if your endpoint doesn't support)
-    agency_contains = (filters.get("agency_contains") or "").strip()
-    if agency_contains:
-        p["department"] = agency_contains
-
-    # Due date upper bound
-    due_before = filters.get("due_before")
-    if due_before:
-        # Expecting ISO date string "YYYY-MM-DD" from UI
-        try:
-            dt = datetime.fromisoformat(str(due_before))
-            p["responseDateTo"] = dt.strftime("%m/%d/%Y")
-        except Exception:
-            pass
-
-    return p
-
-
-def _fetch_records_with_key_rotation(params: Dict[str, Any], api_keys: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Exception]]:
-    """
-    Try each SAM API key until one works (basic rotation / fallback).
-    Returns (records, last_exception).
-    """
-    base = "https://api.sam.gov/opportunities/v2/search"
-    headers = {"Accept": "application/json"}
-
-    last_err: Optional[Exception] = None
-    for key in api_keys:
-        try:
-            p = dict(params)
-            p["api_key"] = key
-            r = requests.get(base, params=p, headers=headers, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            # Different responses sometimes store the list differently
-            recs = data.get("opportunitiesData") or data.get("data") or []
-            return recs, None
-        except Exception as e:
-            last_err = e
-            continue
-
-    return None, last_err
-
-
-def _records_to_table(records: List[Dict[str, Any]]) -> Tuple[List[str], List[List[Any]]]:
-    """
-    Convert raw SAM.gov records into your app’s table shape (list-of-lists).
-    We keep column names consistent with what your CSV likely expects.
-    If a field doesn't exist, we leave it blank.
-    """
-    header = [
-        "notice id",
-        "notice type",
-        "solicitation number",
-        "title",
-        "posted date",
-        "due date",
-        "NAICS Code",
-        "set-aside",
-        "agency",
-        "solicitation link",
-        "item description",
-        # keep space for fields your downstream code might expect (safe to leave blank)
-        "submission instructions",
-        "fulfillment instructions",
-        "quantity",
-        "zip code",
-        "listed supplier",
-        "item part#",
-        "poc name",
-        "poc email",
-        "poc phone",
-    ]
-
-    rows: List[List[Any]] = []
-    for r in records:
-        # Safely pull common fields; fallback to empty string if not present
-        rows.append([
-            r.get("noticeId") or r.get("id") or "",
-            r.get("noticeType") or r.get("type") or "",
-            r.get("solicitationNumber") or r.get("solnum") or "",
-            r.get("title") or "",
-            r.get("postedDate") or r.get("publishDate") or "",
-            r.get("responseDate") or r.get("closeDate") or "",
-            r.get("naics") or r.get("naicsCode") or "",
-            r.get("setAside") or r.get("setAsideCode") or "",
-            r.get("department") or r.get("agency") or r.get("organizationName") or "",
-            r.get("url") or r.get("samLink") or "",
-            r.get("description") or r.get("synopsis") or "",
-            # The remaining are placeholders; fill if/when your endpoint includes them or you derive them
-            r.get("submissionInstructions") or "",
-            r.get("fulfillmentInstructions") or "",
-            r.get("quantity") or "",
-            r.get("zip") or r.get("zipcode") or "",
-            r.get("listedSupplier") or "",
-            r.get("partNumber") or "",
-            _first_poc_name(r) or "",
-            _first_poc_email(r) or "",
-            _first_poc_phone(r) or "",
-        ])
-
-    return header, rows
-
-
-# ------------------------------
-# Optional AI downselect
-# ------------------------------
-
-def _ai_downselect_rows(
-    header: List[str],
-    rows: List[List[Any]],
-    company_desc: str,
-    openai_api_key: str
-) -> List[List[Any]]:
-    """
-    Row-wise binary classification: keep vs drop based on short company description.
-    Fast + cheap: uses gpt-4o-mini by default. Adjust model if desired.
-    """
-    if not rows or not company_desc.strip():
-        return rows
-
-    client = OpenAI(api_key=openai_api_key)
-    # Precompute index map for quick access
-    idx = {col: i for i, col in enumerate(header)}
-    i_title = idx.get("title", 0)
-    i_desc = idx.get("item description", 0)
-
-    kept: List[List[Any]] = []
-    for row in rows:
-        title = str(row[i_title] if i_title < len(row) else "")
-        desc = str(row[i_desc] if i_desc < len(row) else "")
-
-        prompt = f"""
-You are helping downselect government solicitations for a company.
-
-Company description:
-\"\"\"{company_desc.strip()}\"\"\"
-
-Opportunity:
-Title: {title}
-Description: {desc}
-
-Question: Is this opportunity a good fit for the company given the description?
-Respond with a strict JSON object on one line: {{"keep": true/false}}
-        """.strip()
-
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            text = (resp.choices[0].message.content or "").strip()
-            m = re.search(r"\{.*\}", text, flags=re.S)
-            keep = True
-            if m:
-                data = json.loads(m.group(0))
-                keep = bool(data.get("keep", True))
-            if keep:
-                kept.append(row)
-        except Exception:
-            # Fail-open (keep) on any model/network error
-            kept.append(row)
-
-    return kept
-
-
-# ------------------------------
-# Small helpers
-# ------------------------------
-
-def _digits_only(s: str) -> str:
-    return re.sub(r"[^\d]", "", str(s or ""))
-
-def _first_poc_name(rec: Dict[str, Any]) -> str:
-    # Try common PoC shapes; adjust if your endpoint differs
-    # Some records include a list like "pointOfContact": [{"name":"...","email":"..."}]
-    poc = rec.get("pointOfContact") or rec.get("poc") or rec.get("contacts")
-    if isinstance(poc, list) and poc:
-        name = poc[0].get("name") or poc[0].get("fullName")
-        return name or ""
-    if isinstance(poc, dict):
-        return poc.get("name") or poc.get("fullName") or ""
-    return ""
-
-def _first_poc_email(rec: Dict[str, Any]) -> str:
-    poc = rec.get("pointOfContact") or rec.get("poc") or rec.get("contacts")
-    if isinstance(poc, list) and poc:
-        return poc[0].get("email") or ""
-    if isinstance(poc, dict):
-        return poc.get("email") or ""
-    return ""
-
-def _first_poc_phone(rec: Dict[str, Any]) -> str:
-    poc = rec.get("pointOfContact") or rec.get("poc") or rec.get("contacts")
-    if isinstance(poc, list) and poc:
-        return poc[0].get("phone") or poc[0].get("telephone") or ""
-    if isinstance(poc, dict):
-        return poc.get("phone") or poc.get("telephone") or ""
-    return ""
-
-# ---- NEW: raw fetch that returns every field SAM.gov gives us ----
-def get_sam_raw_v3(days_back: int, limit: int, api_keys: list[str], filters: dict) -> list[dict]:
-    """
-    Returns the raw list of opportunity records from SAM.gov (all fields).
-    No OpenAI, no downselection. Just raw JSON dicts as the API returns them.
-    """
-    if not api_keys:
-        return []
-    params = _build_sam_params(days_back, limit, filters)
-    records = []
-    last_err = None
-    for key in api_keys:
-        try:
-            data = _sam_search(key, params)
-            records = data.get("opportunitiesData") or data.get("data") or []
-            break
-        except Exception as e:
-            last_err = e
-            continue
-    if records is None and last_err:
-        raise last_err
-    return records or []
-
-import requests
-
-def get_raw_sam_solicitations(limit: int, api_keys: list[str]) -> list[dict]:
-    """
-    Pull raw SAM.gov solicitations (no filtering, just the full JSON).
-    Returns a list of dicts (one per solicitation).
-    """
-    if not api_keys:
-        raise ValueError("No SAM.gov API keys provided")
-    api_key = api_keys[0]   # rotate if you want, but for now just use the first
-
-    url = "https://api.sam.gov/prod/opportunities/v2/search"
-    params = {
-        "api_key": api_key,
-        "limit": limit,
-        "postedFrom": "2025-08-20T00:00:00Z",  # you can make this dynamic = today
-        "postedTo": "2025-08-20T23:59:59Z"
-    }
-
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    data = resp.json()
-
-    # Each solicitation is under "opportunitiesData"
-    return data.get("opportunitiesData", [])
+    raw = get_sam_raw_v3(days_back=days_back, limit=limit, api_keys=api_keys, filters=filters)
+    rows = [_map_record_to_row(r) for r in raw]
+    return [_TABLE_HEADER, *rows]
