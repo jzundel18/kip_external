@@ -103,18 +103,23 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Tips")
     st.write("• Start with small limits (10–50) while testing.")
-    st.markdown("---")
+
+# === Add this new section anywhere after the above ===
+with st.sidebar:
+    st.markdown("### Feed Settings")
+    max_results_refresh = st.number_input(
+        "Max results when refreshing feed",
+        min_value=50, max_value=2000, value=500, step=50,
+        help="This sets the limit on how many solicitations to pull from SAM.gov when refreshing today's feed."
+    )
+
+# === Your existing Dev Mode section stays as is ===
+with st.sidebar:
     st.markdown("### Dev Mode")
-    DEV_MODE = st.checkbox(
-        "Use sample CSV instead of SAM.gov",
-        value=True,
-        help="When ON, the refresh button will load from sample_feed.csv and not call SAM.gov."
-    )
-    SAMPLE_CSV_PATH = st.text_input(
-        "Sample CSV path",
-        value="sample_feed.csv",
-        help="File used in Dev Mode for refreshing today's feed."
-    )
+    DEV_MODE = st.checkbox("Use sample CSV instead of SAM.gov", value=True,
+                           help="When ON, the refresh button will load from sample_feed.csv and not call SAM.gov.")
+    SAMPLE_CSV_PATH = st.text_input("Sample CSV path", value="sample_feed.csv",
+                                    help="File used in Dev Mode for refreshing today's feed.")
 
 with st.sidebar.expander("🔍 Debug Database"):
     if st.button("Show first 20 rows from DB"):
@@ -199,15 +204,31 @@ def load_df_into_db(df: pd.DataFrame) -> int:
 # ---------------------------
 # Refresh today's feed (Dev Mode aware)
 # ---------------------------
-def refresh_todays_feed():
-    """If DEV_MODE: load from SAMPLE_CSV_PATH; else call SAM.gov once for today's feed and upsert."""
+def refresh_todays_feed(limit: int = 500, cap_dev_csv: bool = True) -> int:
+    """
+    Refresh today's feed into the local DB.
+
+    When DEV_MODE is True:
+      - Loads SAMPLE_CSV_PATH instead of calling SAM.gov.
+      - If cap_dev_csv is True, only the first `limit` rows of the CSV are loaded (handy for testing).
+
+    When DEV_MODE is False:
+      - Calls SAM.gov once using get_relevant_solicitations_v2 with days_back=0 and the given `limit`.
+      - Maps the response into the same schema our DB expects and upserts.
+
+    Returns:
+      int: number of rows inserted/updated (best-effort; based on upserts).
+    """
+    # ---------- DEV MODE: use local CSV, no API calls ----------
     if DEV_MODE:
         if not os.path.exists(SAMPLE_CSV_PATH):
             raise FileNotFoundError(f"Sample CSV not found: {SAMPLE_CSV_PATH}")
         df = pd.read_csv(SAMPLE_CSV_PATH)
+        if cap_dev_csv and isinstance(limit, int) and limit > 0:
+            df = df.head(limit)
         return load_df_into_db(df)
 
-    # Real SAM.gov fetch path (no filters; just 'today')
+    # ---------- REAL MODE: call SAM.gov once ----------
     filters = {
         "keywords_or": [],
         "naics": [],
@@ -218,32 +239,39 @@ def refresh_todays_feed():
         "use_ai_downselect": False,
         "company_desc": "",
     }
+
     list_final = gs.get_relevant_solicitations_v2(
-        days_back=0,
-        limit=1000,
-        api_keys=SAM_KEYS,
+        days_back=0,                 # "today" only
+        limit=int(limit),            # pulled from sidebar "Feed Settings"
+        api_keys=SAM_KEYS,           # from secrets
         filters=filters,
         openai_api_key=OPENAI_API_KEY
     )
+
     if not list_final:
         return 0
+
     header, rows = list_final[0], list_final[1:]
+    # Build a header index for safe lookups
     h = {c: i for i, c in enumerate(header)}
+
+    # Convert to the DataFrame schema our DB loader expects
     data = []
     for r in rows:
         data.append({
-            "notice id": r[h.get("notice id", 0)] if len(r) > h.get("notice id", 0) else "",
-            "notice type": r[h.get("notice type", 0)] if len(r) > h.get("notice type", 0) else "",
-            "solicitation number": r[h.get("solicitation number", 0)] if len(r) > h.get("solicitation number", 0) else "",
-            "title": r[h.get("title", 0)] if len(r) > h.get("title", 0) else "",
-            "posted date": r[h.get("posted date", 0)] if len(r) > h.get("posted date", 0) else "",
-            "due date": r[h.get("due date", 0)] if len(r) > h.get("due date", 0) else "",
-            "NAICS Code": r[h.get("NAICS Code", 0)] if len(r) > h.get("NAICS Code", 0) else "",
-            "set-aside": r[h.get("set-aside", 0)] if len(r) > h.get("set-aside", 0) else "",
-            "agency": r[h.get("agency", 0)] if len(r) > h.get("agency", 0) else "",
-            "solicitation link": r[h.get("solicitation link", 0)] if len(r) > h.get("solicitation link", 0) else "",
-            "item description": r[h.get("item description", 0)] if len(r) > h.get("item description", 0) else "",
+            "notice id":            r[h.get("notice id", 0)] if len(r) > h.get("notice id", 0) else "",
+            "notice type":          r[h.get("notice type", 0)] if len(r) > h.get("notice type", 0) else "",
+            "solicitation number":  r[h.get("solicitation number", 0)] if len(r) > h.get("solicitation number", 0) else "",
+            "title":                r[h.get("title", 0)] if len(r) > h.get("title", 0) else "",
+            "posted date":          r[h.get("posted date", 0)] if len(r) > h.get("posted date", 0) else "",
+            "due date":             r[h.get("due date", 0)] if len(r) > h.get("due date", 0) else "",
+            "NAICS Code":           r[h.get("NAICS Code", 0)] if len(r) > h.get("NAICS Code", 0) else "",
+            "set-aside":            r[h.get("set-aside", 0)] if len(r) > h.get("set-aside", 0) else "",
+            "agency":               r[h.get("agency", 0)] if len(r) > h.get("agency", 0) else "",
+            "solicitation link":    r[h.get("solicitation link", 0)] if len(r) > h.get("solicitation link", 0) else "",
+            "item description":     r[h.get("item description", 0)] if len(r) > h.get("item description", 0) else "",
         })
+
     df = pd.DataFrame(data)
     return load_df_into_db(df)
 
@@ -297,13 +325,21 @@ st.title("GovContract Assistant MVP")
 st.caption("A simple UI around your existing scripts for bid matching, suppliers, and proposal drafting.")
 
 st.info("This app queries today's feed from the local database.")
-colR1, colR2 = st.columns([1, 1])
+# Sidebar control for feed limit
+with st.sidebar:
+    st.markdown("### Feed Settings")
+    max_results_refresh = st.number_input(
+        "Max results when refreshing feed",
+        min_value=50, max_value=2000, value=500, step=50
+    )
+
+colR1, colR2 = st.columns([1,1])
 with colR1:
     if st.button("🔄 Refresh today's feed"):
         try:
-            n = refresh_todays_feed()
+            n = refresh_todays_feed(limit=max_results_refresh)
             src = "sample CSV" if DEV_MODE else "SAM.gov"
-            st.success(f"Refreshed from {src}. Upserted ~{n} rows.")
+            st.success(f"Refreshed from {src}. Upserted ~{n} rows (limit {max_results_refresh}).")
         except Exception as e:
             st.exception(e)
 
@@ -311,10 +347,10 @@ with colR2:
     if st.button("💾 Export DB → sample_feed.csv"):
         try:
             n = export_db_to_sample_csv(SAMPLE_CSV_PATH)
-            st.success(f"Exported {n} rows to {SAMPLE_CSV_PATH}. Enable Dev Mode to use it.")
+            st.success(f"Exported {n} rows to {SAMPLE_CSV_PATH}. You can now enable Dev Mode to use it.")
         except Exception as e:
             st.exception(e)
-
+            
 # ---------------------------
 # Session state
 # ---------------------------
