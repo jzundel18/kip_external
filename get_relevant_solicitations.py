@@ -165,8 +165,6 @@ def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str,
     """Back-compat alias: today's raw records with limit=N (no extra filters)."""
     return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
 
-
-# Helper: map ONE raw record -> ONLY the allowed fields you want to persist
 def map_record_allowed_fields(rec: Dict[str, Any]) -> Dict[str, Any]:
     def g(*keys: str, default: str = "") -> str:
         for k in keys:
@@ -185,15 +183,20 @@ def map_record_allowed_fields(rec: Dict[str, Any]) -> Dict[str, Any]:
     if not link:
         link = g("url", "samLink", default="")
 
-    # Place of performance
+    # Place of performance: city/state can be dicts {code,name}
+    def _name_or_str(x):
+        if isinstance(x, dict):
+            return str(x.get("name") or x.get("code") or "")
+        return str(x or "")
+
     pop = rec.get("placeOfPerformance") or {}
     place_city = ""
     place_state = ""
     place_country_code = ""
     if isinstance(pop, dict):
-        place_city = str(pop.get("city") or "")
-        place_state = str(pop.get("state") or "")
-        place_country_code = str(pop.get("countryCode") or "")
+        place_city = _name_or_str(pop.get("city"))
+        place_state = _name_or_str(pop.get("state"))
+        place_country_code = _name_or_str(pop.get("countryCode"))
 
     return {
         "notice_id":            g("noticeId", "id"),

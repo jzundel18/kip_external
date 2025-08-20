@@ -11,6 +11,54 @@ import streamlit as st
 from datetime import date
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 
+import numpy as np
+from openai import OpenAI
+
+def ai_downselect_df(company_desc: str, df: pd.DataFrame, api_key: str,
+                     threshold: float = 0.20, top_k: int | None = None) -> pd.DataFrame:
+    """
+    Compute cosine similarity between company_desc and each row's (title + description).
+    Keep rows with similarity >= threshold. Optionally keep only top_k.
+    """
+    if df.empty:
+        return df
+
+    # Build texts to embed
+    texts = (df["title"].fillna("") + " " + df["description"].fillna("")).str.slice(0, 3000).tolist()
+
+    try:
+        client = OpenAI(api_key=api_key)
+        # Get embeddings for company & rows (text-embedding-3-small is cheap & good)
+        q = client.embeddings.create(model="text-embedding-3-small", input=[company_desc])
+        Xq = np.array(q.data[0].embedding, dtype=np.float32)
+
+        r = client.embeddings.create(model="text-embedding-3-small", input=texts)
+        X = np.array([d.embedding for d in r.data], dtype=np.float32)
+
+        # cosine similarity
+        Xq_norm = Xq / (np.linalg.norm(Xq) + 1e-9)
+        X_norm = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+        sims = X_norm @ Xq_norm
+
+        df = df.copy()
+        df["ai_score"] = sims
+
+        if top_k is not None and top_k > 0:
+            df = df.sort_values("ai_score", ascending=False).head(int(top_k))
+        else:
+            df = df[df["ai_score"] >= float(threshold)].sort_values("ai_score", ascending=False)
+
+        return df.reset_index(drop=True)
+
+    except Exception as e:
+        st.warning(f"AI downselect unavailable right now ({e}). Falling back to simple keyword filter.")
+        # crude fallback: any word from company desc appearing in title/description
+        kws = [w.lower() for w in re.findall(r"[a-zA-Z0-9]{4,}", company_desc)]
+        if not kws:
+            return df
+        blob = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
+        mask = blob.apply(lambda t: any(k in t for k in kws))
+        return df[mask].reset_index(drop=True)
 # =========================
 # Streamlit page & helpers
 # =========================
@@ -141,13 +189,42 @@ class SolicitationRaw(SQLModel, table=True):
 # Create table
 try:
     SQLModel.metadata.create_all(engine)
-    # Unique index on notice_id (for DO NOTHING upsert)
+# --- lightweight migration: ensure required columns exist ---
+REQUIRED_COLS = {
+    "notice_id": "TEXT",
+    "solicitation_number": "TEXT",
+    "title": "TEXT",
+    "notice_type": "TEXT",
+    "posted_date": "TEXT",
+    "response_date": "TEXT",
+    "archive_date": "TEXT",
+    "department": "TEXT",
+    "agency": "TEXT",
+    "office": "TEXT",
+    "organization_name": "TEXT",
+    "naics_code": "TEXT",
+    "naics_description": "TEXT",
+    "classification_code": "TEXT",
+    "set_aside_code": "TEXT",
+    "set_aside_description": "TEXT",
+    "description": "TEXT",
+    "link": "TEXT",
+    "place_city": "TEXT",
+    "place_state": "TEXT",
+    "place_country_code": "TEXT",
+}
+try:
     with engine.begin() as conn:
-        conn.execute(text("""
+        # create unique index if not exists
+        conn.execute(sa.text("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_solicitationraw_notice_id
-            ON solicitationraw (notice_id);
+            ON solicitationraw (notice_id)
         """))
-except Exception:
+        # add missing columns
+        for col, typ in REQUIRED_COLS.items():
+            conn.execute(sa.text(f'ALTER TABLE solicitationraw ADD COLUMN IF NOT EXISTS "{col}" {typ}'))
+except Exception as _e:
+    # SQLite may not support IF NOT EXISTS in ALTER TABLE; ignore there.
     pass
 
 # =========================
@@ -162,6 +239,8 @@ import generate_proposal as gp
 # Sidebar controls
 # =========================
 with st.sidebar:
+    st.success("✅ API keys loaded from Secrets")
+    st.markdown("---")
     st.markdown("### Feed Settings")
     max_results_refresh = st.number_input(
         "Max results when refreshing feed",
@@ -352,10 +431,15 @@ with tab1:
         "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
         "notice_types": notice_types,
     }
-
+    st.subheader("Company profile (optional)")
+    company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
+    use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
+    ai_threshold = st.slider("AI match threshold", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Higher = stricter")
     if st.button("Fetch from local DB", type="primary"):
         try:
             df = query_filtered_df(filters)
+            if use_ai_downselect and company_desc.strip():
+                df = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY, threshold=ai_threshold)
             if limit_results and not df.empty:
                 df = df.head(int(limit_results))
             if df.empty:
