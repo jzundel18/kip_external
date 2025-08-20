@@ -303,8 +303,11 @@ with colR1:
 with colR2:
     # Optional: show a quick count of rows currently in DB
     with Session(engine) as s:
-        total = s.exec(select(sa.func.count(SolicitationRaw.id))).scalar() or 0
-    st.metric("Rows in DB", f"{int(total)}")    
+        res = s.exec(select(sa.func.count(SolicitationRaw.id)))
+        row = res.first()   # returns (count,) or None
+        total = int(row[0]) if row else 0
+
+st.metric("Rows in DB", f"{total}")  
 
 with colR3:
     if st.button("⬇️ Download entire DB as CSV"):
