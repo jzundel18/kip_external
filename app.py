@@ -326,12 +326,6 @@ st.caption("A simple UI around your existing scripts for bid matching, suppliers
 
 st.info("This app queries today's feed from the local database.")
 # Sidebar control for feed limit
-with st.sidebar:
-    st.markdown("### Feed Settings")
-    max_results_refresh = st.number_input(
-        "Max results when refreshing feed",
-        min_value=50, max_value=2000, value=500, step=50
-    )
 
 colR1, colR2 = st.columns([1,1])
 with colR1:
@@ -350,7 +344,7 @@ with colR2:
             st.success(f"Exported {n} rows to {SAMPLE_CSV_PATH}. You can now enable Dev Mode to use it.")
         except Exception as e:
             st.exception(e)
-            
+
 # ---------------------------
 # Session state
 # ---------------------------
