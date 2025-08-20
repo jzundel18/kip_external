@@ -100,23 +100,14 @@ try:
 except Exception as e:
     st.sidebar.error("❌ Database connection failed")
     st.sidebar.exception(e)
+
+from sqlmodel import Column, JSON
+
 class SolicitationRaw(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     notice_id: str = Field(index=True)
-    notice_type: Optional[str] = None
-    solicitation_number: Optional[str] = None
-    title: Optional[str] = None
-    posted_date: Optional[str] = Field(default=None, index=True)
-    due_date: Optional[str] = Field(default=None, index=True)
-    naics_code: Optional[str] = Field(default=None, index=True)
-    set_aside: Optional[str] = Field(default=None, index=True)
-    agency: Optional[str] = Field(default=None, index=True)
-    link: Optional[str] = None
-    description: Optional[str] = None
-
-    # NEW: keep everything SAM returned (SQLite: TEXT; Postgres: TEXT; fine for both)
-    raw_json: Optional[str] = Field(default=None, sa_column=sa.Column(sa.Text))
+    raw: dict = Field(sa_column=Column(JSON))  # full record from SAM.gov
 
 try:
     SQLModel.metadata.create_all(engine)
@@ -231,95 +222,33 @@ def load_df_into_db(df: pd.DataFrame) -> int:
 # Refresh today's feed (Dev Mode aware)
 # ---------------------------
 def refresh_todays_feed(limit: int = 500) -> int:
-    """
-    Calls SAM.gov once for items posted today (limit=N), maps the response,
-    and upserts rows into the DB. Returns number of rows upserted (approx).
-    """
-    filters = {
-        "keywords_or": [],
-        "naics": [],
-        "set_asides": [],
-        "agency_contains": "",
-        "due_before": None,
-        "notice_types": [],
-        "use_ai_downselect": False,
-        "company_desc": "",
-    }
-
-    list_final = gs.get_relevant_solicitations_v2(
-        days_back=0,              # today only
-        limit=int(limit),
-        api_keys=SAM_KEYS,        # from secrets
-        filters=filters,
-        openai_api_key=OPENAI_API_KEY
-    )
-    if not list_final:
-        return 0
-
-    header, rows = list_final[0], list_final[1:]
-    h = {c: i for i, c in enumerate(header)}
-
-    # Map to our DB schema
-    data = []
-    for r in rows:
-        data.append({
-            "notice id":           r[h.get("notice id", 0)] if len(r) > h.get("notice id", 0) else "",
-            "notice type":         r[h.get("notice type", 0)] if len(r) > h.get("notice type", 0) else "",
-            "solicitation number": r[h.get("solicitation number", 0)] if len(r) > h.get("solicitation number", 0) else "",
-            "title":               r[h.get("title", 0)] if len(r) > h.get("title", 0) else "",
-            "posted date":         r[h.get("posted date", 0)] if len(r) > h.get("posted date", 0) else "",
-            "due date":            r[h.get("due date", 0)] if len(r) > h.get("due date", 0) else "",
-            "NAICS Code":          r[h.get("NAICS Code", 0)] if len(r) > h.get("NAICS Code", 0) else "",
-            "set-aside":           r[h.get("set-aside", 0)] if len(r) > h.get("set-aside", 0) else "",
-            "agency":              r[h.get("agency", 0)] if len(r) > h.get("agency", 0) else "",
-            "solicitation link":   r[h.get("solicitation link", 0)] if len(r) > h.get("solicitation link", 0) else "",
-            "item description":    r[h.get("item description", 0)] if len(r) > h.get("item description", 0) else "",
-        })
-    df = pd.DataFrame(data)
-    return load_df_into_db(df)
-
-def query_today_from_db(filters: dict) -> pd.DataFrame:
-    """Query the local DB and apply UI filters (no SAM calls)."""
-    kws = [k.lower() for k in (filters.get("keywords_or") or []) if k]
-    naics = [re.sub(r"[^\d]", "", x) for x in (filters.get("naics") or []) if x]
-    sas = filters.get("set_asides") or []
-    agency_contains = (filters.get("agency_contains") or "").lower().strip()
-    due_before = filters.get("due_before")
-    notice_types = filters.get("notice_types") or []
+    results = gs.get_raw_sam_solicitations(limit=limit, api_keys=SAM_KEYS)
 
     with Session(engine) as s:
-        stmt = select(SolicitationRaw).where(sa.true())
+        inserted = 0
+        for r in results:
+            notice_id = r.get("noticeId")
+            if not notice_id:
+                continue
+            exists = s.exec(
+                select(SolicitationRaw).where(SolicitationRaw.notice_id == notice_id)
+            ).first()
+            if not exists:
+                s.add(SolicitationRaw(notice_id=notice_id, raw=r))
+                inserted += 1
+            else:
+                exists.raw = r
+        s.commit()
+    return inserted
 
-        if naics:
-            stmt = stmt.where(SolicitationRaw.naics_code.in_(naics))
+def query_today_from_db(filters: dict) -> pd.DataFrame:
+    with Session(engine) as s:
+        rows = s.exec(select(SolicitationRaw)).all()
 
-        if sas:
-            stmt = stmt.where(SolicitationRaw.set_aside.in_(sas))
-
-        if notice_types:
-            ors = [SolicitationRaw.notice_type.ilike(f"%{nt}%") for nt in notice_types]
-            stmt = stmt.where(sa.or_(*ors))
-
-        if agency_contains:
-            stmt = stmt.where(SolicitationRaw.agency.ilike(f"%{agency_contains}%"))
-
-        rows = s.exec(stmt).all()
-
-    df = _table_to_df(rows)
-    if df.empty:
-        return df
-
-    # Keywords OR (title + description)
-    if kws:
-        blob = (df["title"].fillna("") + " " + df["item description"].fillna("")).str.lower()
-        df = df[blob.apply(lambda t: any(k in t for k in kws))]
-
-    # Due before (parse as date)
-    if due_before and "due date" in df.columns:
-        dd = pd.to_datetime(df["due date"], errors="coerce", utc=True)
-        df = df[dd.dt.date <= pd.to_datetime(due_before).date()]
-
-    return df.reset_index(drop=True)
+    # Flatten JSON for display
+    df = pd.json_normalize([r.raw for r in rows])
+    return df
+    
 
 # ---------------------------
 # Header & global controls
