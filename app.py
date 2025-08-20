@@ -68,6 +68,8 @@ if missing:
     st.error(f"Missing required secrets: {', '.join(missing)}")
     st.stop()
 
+import urllib.parse
+
 # ---------------------------
 # DB setup (SQLite by default; Supabase if provided)
 # ---------------------------
