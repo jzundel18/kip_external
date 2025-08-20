@@ -189,30 +189,30 @@ class SolicitationRaw(SQLModel, table=True):
 # Create table
 try:
     SQLModel.metadata.create_all(engine)
-# --- lightweight migration: ensure required columns exist ---
-REQUIRED_COLS = {
-    "notice_id": "TEXT",
-    "solicitation_number": "TEXT",
-    "title": "TEXT",
-    "notice_type": "TEXT",
-    "posted_date": "TEXT",
-    "response_date": "TEXT",
-    "archive_date": "TEXT",
-    "department": "TEXT",
-    "agency": "TEXT",
-    "office": "TEXT",
-    "organization_name": "TEXT",
-    "naics_code": "TEXT",
-    "naics_description": "TEXT",
-    "classification_code": "TEXT",
-    "set_aside_code": "TEXT",
-    "set_aside_description": "TEXT",
-    "description": "TEXT",
-    "link": "TEXT",
-    "place_city": "TEXT",
-    "place_state": "TEXT",
-    "place_country_code": "TEXT",
-}
+    # --- lightweight migration: ensure required columns exist ---
+    REQUIRED_COLS = {
+        "notice_id": "TEXT",
+        "solicitation_number": "TEXT",
+        "title": "TEXT",
+        "notice_type": "TEXT",
+        "posted_date": "TEXT",
+        "response_date": "TEXT",
+        "archive_date": "TEXT",
+        "department": "TEXT",
+        "agency": "TEXT",
+        "office": "TEXT",
+        "organization_name": "TEXT",
+        "naics_code": "TEXT",
+        "naics_description": "TEXT",
+        "classification_code": "TEXT",
+        "set_aside_code": "TEXT",
+        "set_aside_description": "TEXT",
+        "description": "TEXT",
+        "link": "TEXT",
+        "place_city": "TEXT",
+        "place_state": "TEXT",
+        "place_country_code": "TEXT",
+    }
 try:
     with engine.begin() as conn:
         # create unique index if not exists
