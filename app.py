@@ -10,6 +10,9 @@ from datetime import date
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy.engine.url import make_url
 
+import get_relevant_solicitations as gs
+from get_relevant_solicitations import SamQuotaError, SamAuthError, SamBadRequestError
+
 # =========================
 # Streamlit page & helpers
 # =========================
@@ -299,6 +302,12 @@ with colR1:
         try:
             n = refresh_todays_feed(limit=max_results_refresh)
             st.success(f"Refreshed from SAM.gov. Upserted ~{n} rows (limit {max_results_refresh}).")
+        except SamQuotaError as e:
+            st.warning("SAM.gov quota likely exceeded on all provided keys. Try again after daily reset or add more keys.")
+        except SamBadRequestError as e:
+            st.error(f"Bad request to SAM.gov: {e}")
+        except SamAuthError as e:
+            st.error("All SAM.gov keys failed (auth/network). Double-check your keys in Secrets.")
         except Exception as e:
             st.exception(e)
 

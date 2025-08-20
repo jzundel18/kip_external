@@ -10,53 +10,104 @@ import time
 # Per the current SAM.gov v2 docs, production URL omits '/prod'
 SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 
+# ---- Custom errors so the UI can show a friendly message ----
+class SamQuotaError(Exception):
+    def __init__(self, key_label: str, message: str, status: int | None = None):
+        super().__init__(message)
+        self.key_label = key_label
+        self.status = status
+
+class SamAuthError(Exception):
+    def __init__(self, key_label: str, message: str, status: int | None = None):
+        super().__init__(message)
+        self.key_label = key_label
+        self.status = status
+
+class SamBadRequestError(Exception):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
 def _mmddyyyy(d: date) -> str:
-    """Return 'MM/dd/YYYY' as required by SAM v2 for date params like postedFrom/postedTo."""
     return d.strftime("%m/%d/%Y")
 
 def _window_days_back(days_back: int) -> tuple[str, str]:
-    """
-    Return (postedFrom, postedTo) in 'MM/dd/YYYY'.
-    days_back = 0 => today only
-    days_back = N => [today - N, today]
-    """
     today = date.today()
     start = today - timedelta(days=max(0, int(days_back)))
     return (_mmddyyyy(start), _mmddyyyy(today))
+
+def _mask_key(k: str) -> str:
+    if not k:
+        return "(none)"
+    return f"...{k[-4:]}"  # show only last 4
 
 def _pick_api_key(api_keys: List[str], attempt: int) -> Optional[str]:
     if not api_keys:
         return None
     return api_keys[attempt % len(api_keys)]
 
-def _request_sam(params: Dict[str, Any], api_keys: List[str], max_attempts: int = 3) -> Dict[str, Any]:
+def _request_sam(params: Dict[str, Any], api_keys: List[str]) -> Dict[str, Any]:
     """
-    Make a single SAM.gov request with basic retry & key rotation.
-    Raises the last error if all attempts fail.
+    Try each api_key once. If a key hits quota/auth, rotate to the next.
+    If all keys fail, raise a clear aggregated error.
     """
-    last_exc = None
-    for attempt in range(max_attempts):
-        key = _pick_api_key(api_keys, attempt)
-        if not key:
-            raise ValueError("No SAM.gov API key provided.")
+    if not api_keys:
+        raise ValueError("No SAM.gov API keys provided.")
+
+    errors: list[str] = []
+
+    for key in api_keys:
         try:
             full_params = dict(params)
             full_params["api_key"] = key
             resp = requests.get(SAM_BASE_URL, params=full_params, timeout=30)
+
+            # Quick, readable reason if SAM returns JSON with message
+            txt = ""
+            try:
+                j = resp.json()
+                txt = (j.get("message") or j.get("error") or "") if isinstance(j, dict) else ""
+            except Exception:
+                pass
+
+            if resp.status_code == 429:
+                errors.append(f"{_mask_key(key)} → 429 Too Many Requests (quota). {txt}")
+                # try next key
+                continue
+
+            if resp.status_code in (401, 403):
+                # Distinguish quota text if present in body
+                if any(s in (txt or "").lower() for s in ["exceeded", "limit", "quota"]):
+                    errors.append(f"{_mask_key(key)} → {resp.status_code} quota/limit. {txt}")
+                else:
+                    errors.append(f"{_mask_key(key)} → {resp.status_code} auth error. {txt}")
+                continue
+
+            if resp.status_code == 400:
+                # Bad params (dates, etc) – don't rotate, this is caller-side
+                raise SamBadRequestError(f"400 Bad Request from SAM.gov. {txt or resp.text}", status=400)
+
             resp.raise_for_status()
             return resp.json() or {}
-        except requests.HTTPError as e:
-            last_exc = e
-            time.sleep(0.5)
-            continue
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(0.5)
-            continue
-    if last_exc:
-        raise last_exc
-    return {}
 
+        except SamBadRequestError:
+            # Propagate immediately: caller should fix inputs
+            raise
+        except requests.RequestException as e:
+            errors.append(f"{_mask_key(key)} → network error: {e}")
+            # try next key
+            time.sleep(0.3)
+            continue
+
+    # All keys exhausted
+    if errors:
+        # If any mention of quota/limit, raise a quota error for clarity
+        if any(("quota" in e.lower() or "limit" in e.lower() or "429" in e) for e in errors):
+            raise SamQuotaError("all-keys", "All SAM.gov keys appear rate-limited / out of daily quota.", None)
+        raise SamAuthError("all-keys", "All SAM.gov keys failed (auth/network). Check keys or network.", None)
+
+    # Fallback (shouldn't hit)
+    raise SamAuthError("all-keys", "SAM.gov request failed.", None)
 def get_sam_raw_v3(
     days_back: int,
     limit: int,
