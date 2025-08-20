@@ -7,3 +7,5 @@ python-dateutil
 beautifulsoup4
 lxml
 python-docx
+sqlmodel
+sqlalchemy
