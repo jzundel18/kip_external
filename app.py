@@ -52,6 +52,13 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 SERP_API_KEY   = get_secret("SERP_API_KEY")
 SAM_KEYS       = get_secret("SAM_KEYS", [])
 
+# Normalize SAM_KEYS so it's always a list
+if isinstance(SAM_KEYS, str):
+    # support comma-separated string in secrets.toml
+    SAM_KEYS = [k.strip() for k in SAM_KEYS.split(",") if k.strip()]
+elif not isinstance(SAM_KEYS, (list, tuple)):
+    SAM_KEYS = []
+
 missing = [k for k, v in {
     "OPENAI_API_KEY": OPENAI_API_KEY,
     "SERP_API_KEY": SERP_API_KEY,
@@ -69,7 +76,6 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 
 class SolicitationRaw(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
-
     id: Optional[int] = Field(default=None, primary_key=True)
     notice_id: str = Field(index=True)
     notice_type: Optional[str] = None
@@ -95,38 +101,20 @@ import get_relevant_solicitations as gs
 import find_relevant_suppliers as fs
 import generate_proposal as gp
 
-# ---------------------------
-# Sidebar
-# ---------------------------
+# ----- Sidebar -----
 with st.sidebar:
     st.success("✅ API keys loaded from Secrets")
-    st.markdown("---")
-    st.subheader("Tips")
-    st.write("• Start with small limits (10–50) while testing.")
 
-# === Add this new section anywhere after the above ===
-with st.sidebar:
     st.markdown("### Feed Settings")
     max_results_refresh = st.number_input(
         "Max results when refreshing feed",
         min_value=50, max_value=2000, value=500, step=50,
-        help="This sets the limit on how many solicitations to pull from SAM.gov when refreshing today's feed."
+        help="How many solicitations to pull from SAM.gov when you click Refresh."
     )
 
-# === Your existing Dev Mode section stays as is ===
-with st.sidebar:
-    st.markdown("### Dev Mode")
-    DEV_MODE = st.checkbox("Use sample CSV instead of SAM.gov", value=True,
-                           help="When ON, the refresh button will load from sample_feed.csv and not call SAM.gov.")
-    SAMPLE_CSV_PATH = st.text_input("Sample CSV path", value="sample_feed.csv",
-                                    help="File used in Dev Mode for refreshing today's feed.")
-
-with st.sidebar.expander("🔍 Debug Database"):
-    if st.button("Show first 20 rows from DB"):
-        with Session(engine) as s:
-            rows = s.exec(select(SolicitationRaw).limit(20)).all()
-        dbg_df = pd.DataFrame([r.__dict__ for r in rows])
-        st.dataframe(dbg_df, use_container_width=True)
+    st.markdown("---")
+    st.subheader("Tips")
+    st.write("• Start with small limits (100–500) while testing.")
 
 # ---------------------------
 # Small DB helpers
@@ -204,31 +192,11 @@ def load_df_into_db(df: pd.DataFrame) -> int:
 # ---------------------------
 # Refresh today's feed (Dev Mode aware)
 # ---------------------------
-def refresh_todays_feed(limit: int = 500, cap_dev_csv: bool = True) -> int:
+def refresh_todays_feed(limit: int = 500) -> int:
     """
-    Refresh today's feed into the local DB.
-
-    When DEV_MODE is True:
-      - Loads SAMPLE_CSV_PATH instead of calling SAM.gov.
-      - If cap_dev_csv is True, only the first `limit` rows of the CSV are loaded (handy for testing).
-
-    When DEV_MODE is False:
-      - Calls SAM.gov once using get_relevant_solicitations_v2 with days_back=0 and the given `limit`.
-      - Maps the response into the same schema our DB expects and upserts.
-
-    Returns:
-      int: number of rows inserted/updated (best-effort; based on upserts).
+    Calls SAM.gov once for items posted today (limit=N), maps the response,
+    and upserts rows into the DB. Returns number of rows upserted (approx).
     """
-    # ---------- DEV MODE: use local CSV, no API calls ----------
-    if DEV_MODE:
-        if not os.path.exists(SAMPLE_CSV_PATH):
-            raise FileNotFoundError(f"Sample CSV not found: {SAMPLE_CSV_PATH}")
-        df = pd.read_csv(SAMPLE_CSV_PATH)
-        if cap_dev_csv and isinstance(limit, int) and limit > 0:
-            df = df.head(limit)
-        return load_df_into_db(df)
-
-    # ---------- REAL MODE: call SAM.gov once ----------
     filters = {
         "keywords_or": [],
         "naics": [],
@@ -241,37 +209,34 @@ def refresh_todays_feed(limit: int = 500, cap_dev_csv: bool = True) -> int:
     }
 
     list_final = gs.get_relevant_solicitations_v2(
-        days_back=0,                 # "today" only
-        limit=int(limit),            # pulled from sidebar "Feed Settings"
-        api_keys=SAM_KEYS,           # from secrets
+        days_back=0,              # today only
+        limit=int(limit),
+        api_keys=SAM_KEYS,        # from secrets
         filters=filters,
         openai_api_key=OPENAI_API_KEY
     )
-
     if not list_final:
         return 0
 
     header, rows = list_final[0], list_final[1:]
-    # Build a header index for safe lookups
     h = {c: i for i, c in enumerate(header)}
 
-    # Convert to the DataFrame schema our DB loader expects
+    # Map to our DB schema
     data = []
     for r in rows:
         data.append({
-            "notice id":            r[h.get("notice id", 0)] if len(r) > h.get("notice id", 0) else "",
-            "notice type":          r[h.get("notice type", 0)] if len(r) > h.get("notice type", 0) else "",
-            "solicitation number":  r[h.get("solicitation number", 0)] if len(r) > h.get("solicitation number", 0) else "",
-            "title":                r[h.get("title", 0)] if len(r) > h.get("title", 0) else "",
-            "posted date":          r[h.get("posted date", 0)] if len(r) > h.get("posted date", 0) else "",
-            "due date":             r[h.get("due date", 0)] if len(r) > h.get("due date", 0) else "",
-            "NAICS Code":           r[h.get("NAICS Code", 0)] if len(r) > h.get("NAICS Code", 0) else "",
-            "set-aside":            r[h.get("set-aside", 0)] if len(r) > h.get("set-aside", 0) else "",
-            "agency":               r[h.get("agency", 0)] if len(r) > h.get("agency", 0) else "",
-            "solicitation link":    r[h.get("solicitation link", 0)] if len(r) > h.get("solicitation link", 0) else "",
-            "item description":     r[h.get("item description", 0)] if len(r) > h.get("item description", 0) else "",
+            "notice id":           r[h.get("notice id", 0)] if len(r) > h.get("notice id", 0) else "",
+            "notice type":         r[h.get("notice type", 0)] if len(r) > h.get("notice type", 0) else "",
+            "solicitation number": r[h.get("solicitation number", 0)] if len(r) > h.get("solicitation number", 0) else "",
+            "title":               r[h.get("title", 0)] if len(r) > h.get("title", 0) else "",
+            "posted date":         r[h.get("posted date", 0)] if len(r) > h.get("posted date", 0) else "",
+            "due date":            r[h.get("due date", 0)] if len(r) > h.get("due date", 0) else "",
+            "NAICS Code":          r[h.get("NAICS Code", 0)] if len(r) > h.get("NAICS Code", 0) else "",
+            "set-aside":           r[h.get("set-aside", 0)] if len(r) > h.get("set-aside", 0) else "",
+            "agency":              r[h.get("agency", 0)] if len(r) > h.get("agency", 0) else "",
+            "solicitation link":   r[h.get("solicitation link", 0)] if len(r) > h.get("solicitation link", 0) else "",
+            "item description":    r[h.get("item description", 0)] if len(r) > h.get("item description", 0) else "",
         })
-
     df = pd.DataFrame(data)
     return load_df_into_db(df)
 
@@ -324,27 +289,49 @@ def query_today_from_db(filters: dict) -> pd.DataFrame:
 st.title("GovContract Assistant MVP")
 st.caption("A simple UI around your existing scripts for bid matching, suppliers, and proposal drafting.")
 
-st.info("This app queries today's feed from the local database.")
-# Sidebar control for feed limit
+st.info("This app pulls from SAM.gov into the database once, then all filters query the DB (no extra API calls).")
 
-colR1, colR2 = st.columns([1,1])
+colR1, colR2, colR3 = st.columns([1,1,1])
 with colR1:
     if st.button("🔄 Refresh today's feed"):
         try:
             n = refresh_todays_feed(limit=max_results_refresh)
-            src = "sample CSV" if DEV_MODE else "SAM.gov"
-            st.success(f"Refreshed from {src}. Upserted ~{n} rows (limit {max_results_refresh}).")
+            st.success(f"Refreshed from SAM.gov. Upserted ~{n} rows (limit {max_results_refresh}).")
         except Exception as e:
             st.exception(e)
 
 with colR2:
-    if st.button("💾 Export DB → sample_feed.csv"):
-        try:
-            n = export_db_to_sample_csv(SAMPLE_CSV_PATH)
-            st.success(f"Exported {n} rows to {SAMPLE_CSV_PATH}. You can now enable Dev Mode to use it.")
-        except Exception as e:
-            st.exception(e)
+    # Optional: show a quick count of rows currently in DB
+    with Session(engine) as s:
+        total = s.exec(select(sa.func.count(SolicitationRaw.id))).scalar() or 0
+    st.metric("Rows in DB", f"{int(total)}")    
 
+with colR3:
+    if st.button("⬇️ Download entire DB as CSV"):
+        with Session(engine) as s:
+            rows = s.exec(select(SolicitationRaw)).all()
+        df_all = pd.DataFrame([{
+            "notice id": r.notice_id,
+            "notice type": r.notice_type,
+            "solicitation number": r.solicitation_number,
+            "title": r.title,
+            "posted date": r.posted_date,
+            "due date": r.due_date,
+            "NAICS Code": r.naics_code,
+            "set-aside": r.set_aside,
+            "agency": r.agency,
+            "solicitation link": r.link,
+            "item description": r.description,
+        } for r in rows])
+        if df_all.empty:
+            st.warning("Database is empty.")
+        else:
+            st.download_button(
+                "Download solicitations.csv",
+                df_all.to_csv(index=False).encode("utf-8"),
+                file_name="solicitations.csv",
+                mime="text/csv"
+            )
 # ---------------------------
 # Session state
 # ---------------------------
