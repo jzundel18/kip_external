@@ -68,6 +68,8 @@ DB_URL = st.secrets.get("SUPABASE_DB_URL") or "sqlite:///app.db"
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
 class SolicitationRaw(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
+
     id: Optional[int] = Field(default=None, primary_key=True)
     notice_id: str = Field(index=True)
     notice_type: Optional[str] = None
