@@ -74,8 +74,32 @@ import urllib.parse
 # DB setup (SQLite by default; Supabase if provided)
 # ---------------------------
 DB_URL = st.secrets.get("SUPABASE_DB_URL") or "sqlite:///app.db"
-engine = create_engine(DB_URL, pool_pre_ping=True)
 
+if DB_URL.startswith("postgresql+psycopg2://"):
+    engine = create_engine(
+        DB_URL,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=2,
+        connect_args={
+            "sslmode": "require",
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        },
+    )
+else:
+    engine = create_engine(DB_URL, pool_pre_ping=True)
+try:
+    with engine.connect() as conn:
+        version = conn.execute(sa.text("select version()")).first()
+    st.sidebar.success("✅ Connected to Supabase Postgres (pooled)")
+    if version and isinstance(version, tuple):
+        st.sidebar.caption(version[0])
+except Exception as e:
+    st.sidebar.error("❌ Database connection failed")
+    st.sidebar.exception(e)
 class SolicitationRaw(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
