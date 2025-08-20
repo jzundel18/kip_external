@@ -251,51 +251,74 @@ with st.sidebar:
 # Upsert-only-new helpers
 # =========================
 ALLOWED_COLUMNS = [
-    "notice_id","solicitation_number","title","notice_type",
+    "pulled_at","notice_id","solicitation_number","title","notice_type",
     "posted_date","response_date","archive_date",
-    "department","agency","office","organization_name",
-    "naics_code","naics_description","classification_code",
-    "set_aside_code","set_aside_description",
+    "agency","organization_name",
+    "naics_code",
+    "set_aside_code",
     "description","link",
-    "place_city","place_state","place_country_code",
 ]
-
-def insert_new_records_only(records: List[Dict[str, Any]]) -> int:
+def insert_new_records_only(records) -> int:
     """
-    Insert ONLY records that do not already exist (by notice_id).
-    Skip updates. Use ON CONFLICT DO NOTHING.
+    Insert ONLY brand-new notices into Supabase (no updates).
+    - Uses ON CONFLICT (notice_id) DO NOTHING
+    - Does NOT send pulled_at; DB fills it with DEFAULT NOW()
+    Expects `records` to be a list[dict] from get_sam_raw_v3().
     """
     if not records:
         return 0
 
-    # Map raw records -> allowed fields only
-    mapped: List[Dict[str, Any]] = []
+    rows = []
     for r in records:
+        # map the SAM record to the exact columns we persist
         m = gs.map_record_allowed_fields(r)
-        # Keep only allowed columns
-        m = {k: m.get(k) for k in ALLOWED_COLUMNS}
-        # Require notice_id
-        if str(m.get("notice_id") or "").strip():
-            mapped.append(m)
 
-    if not mapped:
+        notice_id = (m.get("notice_id") or "").strip()
+        if not notice_id:
+            continue
+
+        rows.append({
+            "notice_id":            notice_id,
+            "solicitation_number":  m.get("solicitation_number") or "",
+            "title":                m.get("title") or "",
+            "notice_type":          m.get("notice_type") or "",
+            "posted_date":          m.get("posted_date") or "",
+            "response_date":        m.get("response_date") or "",
+            "archive_date":         m.get("archive_date") or "",
+            "agency":               m.get("agency") or "",
+            "organization_name":    m.get("organization_name") or "",
+            "naics_code":           m.get("naics_code") or "",
+            "set_aside_code":       m.get("set_aside_code") or "",
+            "description":          m.get("description") or "",
+            "link":                 m.get("link") or "",
+        })
+
+    if not rows:
         return 0
 
-    cols = ALLOWED_COLUMNS
-    col_list = ", ".join(cols)
-    placeholders = ", ".join([f":{c}" for c in cols])
-    sql = text(f"""
-        INSERT INTO solicitationraw ({col_list})
-        VALUES ({placeholders})
+    # executemany insert with ON CONFLICT DO NOTHING
+    sql = sa.text("""
+        INSERT INTO solicitationraw (
+            notice_id, solicitation_number, title, notice_type,
+            posted_date, response_date, archive_date,
+            agency, organization_name,
+            naics_code, set_aside_code,
+            description, link
+        ) VALUES (
+            :notice_id, :solicitation_number, :title, :notice_type,
+            :posted_date, :response_date, :archive_date,
+            :agency, :organization_name,
+            :naics_code, :set_aside_code,
+            :description, :link
+        )
         ON CONFLICT (notice_id) DO NOTHING
     """)
 
-    inserted = 0
     with engine.begin() as conn:
-        for row in mapped:
-            conn.execute(sql, row)
-            inserted += 1  # counts attempted inserts; rows that already exist don't error
-    return inserted
+        conn.execute(sql, rows)  # bulk insert
+
+    # returns attempted inserts (conflicts are silently ignored)
+    return len(rows)
 
 def query_filtered_df(filters: dict) -> pd.DataFrame:
     """
