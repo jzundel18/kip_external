@@ -98,9 +98,7 @@ def get_secret(name, default=None):
         return st.secrets[name]
     return os.getenv(name, default)
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Missing OPENAI_API_KEY in Streamlit secrets.")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 SERP_API_KEY   = get_secret("SERP_API_KEY")
 SAM_KEYS       = get_secret("SAM_KEYS", [])
 
@@ -497,73 +495,62 @@ with tab1:
     st.subheader("Company profile (optional)")
     company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
-    ai_threshold = st.slider("AI match threshold", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Higher = stricter")
-    if st.button("Show Results", type="primary"):
+
+    # One-button flow: manual filters always; optional AI ranking (top 5) when checkbox + description
+    if st.button("Show top results", type="primary", key="btn_show_results"):
         try:
+            # 1) Apply manual filters from DB (no SAM calls)
             df = query_filtered_df(filters)
-            if use_ai_downselect and company_desc.strip():
-                df = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY, threshold=ai_threshold)
-            if limit_results and not df.empty:
-                df = df.head(int(limit_results))
+
             if df.empty:
                 st.warning("No solicitations match your filters. Try adjusting filters or refresh today's feed.")
+                st.session_state.sol_df = None
             else:
+                # Save the filtered set (so Tab 2 can use it, etc.)
                 st.session_state.sol_df = df
-                st.success(f"Found {len(df)} solicitations.")
-        except Exception as e:
-            st.exception(e)
 
-    if st.session_state.sol_df is not None:
-        st.subheader("Solicitations")
-        st.dataframe(st.session_state.sol_df, use_container_width=True)
-        st.download_button(
-            "Download filtered as CSV",
-            st.session_state.sol_df.to_csv(index=False).encode("utf-8"),
-            file_name="sol_list.csv",
-            mime="text/csv"
-        )
-    # Only show AI ranking controls when we have a table to rank
-    if st.session_state.sol_df is not None:
-        st.markdown("### AI: Rank Top 5 by Company Fit")
-        st.caption("Uses your company description to rank the most relevant opportunities. Shows titles first; click to expand details.")
-
-        # Reuse the company_desc field you already capture above; if not present, add a small input here:
-        if not company_desc.strip():
-            company_desc_local = st.text_area("Brief Company Description (if you didn’t fill it above)", value="", height=120, key="company_desc_local")
-        else:
-            company_desc_local = company_desc
-
-        col_r1, col_r2 = st.columns([1, 4])
-        with col_r1:
-            if st.button("Rank top 5 by fit (AI)", type="primary", key="btn_rank_ai"):
-                if not company_desc_local.strip():
-                    st.error("Please enter a company description to rank against.")
-                else:
-                    with st.spinner("Scoring and ranking…"):
+                # 2) If AI downselect is checked & description present, rank & show top 5 (title-first, expandable details)
+                if use_ai_downselect and company_desc.strip():
+                    with st.spinner("Ranking top matches with AI…"):
                         ranked = ai_rank_solicitations_by_fit(
-                            st.session_state.sol_df,
-                            company_desc_local,
-                            OPENAI_API_KEY,
+                            df=st.session_state.sol_df,
+                            company_desc=company_desc.strip(),
+                            api_key=OPENAI_API_KEY,
                             top_k=5,
-                            max_candidates=100,
+                            max_candidates=100,   # adjust cost/speed as you like
+                            model="gpt-4o-mini",
                         )
+
                     if not ranked:
-                        st.warning("No ranking returned (possibly not enough description text or model parsing issue).")
+                        st.info("AI ranking returned no results; showing the manually filtered table instead.")
+                        # Show the table
+                        show_df = st.session_state.sol_df.head(int(limit_results)) if limit_results else st.session_state.sol_df
+                        st.subheader(f"Solicitations ({len(show_df)})")
+                        st.dataframe(show_df, use_container_width=True)
+                        st.download_button(
+                            "Download filtered as CSV",
+                            show_df.to_csv(index=False).encode("utf-8"),
+                            file_name="sol_list.csv",
+                            mime="text/csv"
+                        )
                     else:
                         # Build a quick lookup for details by notice_id
-                        df = st.session_state.sol_df
-                        idx_by_id = {str(x): i for i, x in enumerate(df["notice_id"].astype(str).tolist())}
+                        base_df = st.session_state.sol_df
+                        idx_by_id = {str(x): i for i, x in enumerate(base_df["notice_id"].astype(str).tolist())}
 
-                        st.success(f"Top {len(ranked)} matches:")
+                        # Compose a small DataFrame for download (top-5 ranked rows)
+                        top_rows = []
+                        st.success(f"Top {len(ranked)} matches by company fit:")
                         for i, item in enumerate(ranked, start=1):
                             nid = item["notice_id"]
-                            score = int(round(item["score"]))
+                            score = int(round(item.get("score", 0)))
                             reason = item.get("reason", "")
-                            row = df.iloc[idx_by_id[nid]]
+                            row = base_df.iloc[idx_by_id[nid]]
 
-                            # Title first; click to expand details
-                            with st.expander(f"{i}. {row.get('title', 'Untitled')}  —  Score {score}/100"):
-                                # Show a compact details block
+                            # accumulate for download
+                            top_rows.append(row)
+
+                            with st.expander(f"{i}. {row.get('title', 'Untitled')} — Score {score}/100"):
                                 st.write(f"**Notice ID:** {nid}")
                                 st.write(f"**Notice Type:** {row.get('notice_type','')}")
                                 st.write(f"**Posted:** {row.get('posted_date','')}")
@@ -581,6 +568,30 @@ with tab1:
                                     st.markdown("**Why this matched (AI):**")
                                     st.info(reason)
 
+                        # Offer download of just the top-5
+                        if top_rows:
+                            top_df = pd.DataFrame(top_rows).reset_index(drop=True)
+                            st.download_button(
+                                "Download Top-5 (AI-ranked) as CSV",
+                                top_df.to_csv(index=False).encode("utf-8"),
+                                file_name="top5_ai_ranked.csv",
+                                mime="text/csv"
+                            )
+
+                else:
+                    # 3) No AI requested; show the manually filtered table (capped by limit_results)
+                    show_df = st.session_state.sol_df.head(int(limit_results)) if limit_results else st.session_state.sol_df
+                    st.subheader(f"Solicitations ({len(show_df)})")
+                    st.dataframe(show_df, use_container_width=True)
+                    st.download_button(
+                        "Download filtered as CSV",
+                        show_df.to_csv(index=False).encode("utf-8"),
+                        file_name="sol_list.csv",
+                        mime="text/csv"
+                    )
+
+        except Exception as e:
+            st.exception(e)
 # ---- Tab 2
 with tab2:
     st.header("Find Supplier Suggestions")
