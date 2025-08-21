@@ -4,12 +4,16 @@
 from __future__ import annotations
 from datetime import date, timedelta
 from typing import List, Dict, Any, Optional
-import requests, time, html, re
 
-# Production v2 endpoint (per current docs)
-SAM_BASE_URL = "https://api.sam.gov/prod/opportunities/v2/search"
-SAM_DESC_URL_V1 = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
+import requests
+import time
+import html
+import re
+
+# --- Endpoints (use /prod/) ---
+SAM_BASE_URL      = "https://api.sam.gov/prod/opportunities/v2/search"
 SAM_SEARCH_URL_V2 = "https://api.sam.gov/prod/opportunities/v2/search"
+SAM_DESC_URL_V1   = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
 
 # ---- Custom errors for friendly UI messages ----
 class SamQuotaError(Exception):
@@ -21,6 +25,39 @@ class SamAuthError(Exception):
 class SamBadRequestError(Exception):
     pass
 
+# --- Date helpers ---
+_DATE_ISO_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+_DATE_US_RE  = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})")
+
+def _normalize_date(val: str) -> str:
+    """
+    Return YYYY-MM-DD if we can, else 'None' if empty/placeholder, else original string.
+    Handles ISO dates (with time) and US MM/DD/YYYY.
+    """
+    if not val:
+        return "None"
+    s = str(val).strip()
+    if not s or s.lower() in ("none", "n/a", "na"):
+        return "None"
+
+    # ISO-like (may include time)
+    m = _DATE_ISO_RE.search(s)
+    if m:
+        return m.group(1)
+
+    # US m/d/yyyy -> yyyy-mm-dd
+    m = _DATE_US_RE.search(s)
+    if m:
+        mm, dd, yyyy = m.group(1).split("/")
+        return f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+
+    # If contains 'T', try left of T
+    if "T" in s:
+        left = s.split("T", 1)[0]
+        if _DATE_ISO_RE.match(left):
+            return left
+
+    return s
 
 def _mmddyyyy(d: date) -> str:
     return d.strftime("%m/%d/%Y")
@@ -36,6 +73,7 @@ def _mask_key(k: str) -> str:
     return f"...{k[-4:]}"
 
 
+# --- HTTP core with key rotation ---
 def _request_sam(params: Dict[str, Any], api_keys: List[str]) -> Dict[str, Any]:
     """
     Try each api_key once. If a key hits quota/auth, rotate to the next.
@@ -93,6 +131,7 @@ def _request_sam(params: Dict[str, Any], api_keys: List[str]) -> Dict[str, Any]:
     raise SamAuthError("SAM.gov request failed.")
 
 
+# --- Public fetchers ---
 def get_sam_raw_v3(
     days_back: int,
     limit: int,
@@ -147,9 +186,11 @@ def get_sam_raw_v3(
 
         due_before = filters.get("due_before")
         if due_before:
-            # SAM uses dueDate for response/due
-            resp = (rec.get("dueDate") or rec.get("closeDate") or rec.get("responseDueDate") or "")[:10]
-            if resp and resp > str(due_before):
+            raw = (rec.get("dueDate") or rec.get("responseDueDate") or
+                   rec.get("closeDate") or rec.get("responseDate") or
+                   rec.get("responseDateTime") or "")
+            resp_norm = _normalize_date(raw)
+            if resp_norm != "None" and resp_norm > str(due_before):
                 return False
 
         return True
@@ -162,7 +203,7 @@ def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str,
     return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
 
 
-
+# --- helpers used by detail/description ---
 def _rotate_keys(keys: List[str]):
     while True:
         for k in keys:
@@ -209,7 +250,7 @@ def fetch_notice_description(notice_id: str, api_keys: List[str]) -> str:
     """
     # 1) try v2 detail
     detail = fetch_notice_detail_v2(notice_id, api_keys)
-    for k in ("description","synopsis","longDescription","fullDescription","additionalInfo"):
+    for k in ("description", "synopsis", "longDescription", "fullDescription", "additionalInfo"):
         val = detail.get(k)
         if val and str(val).strip():
             return re.sub(r"\s+", " ", str(val)).strip()
@@ -234,39 +275,62 @@ def fetch_notice_description(notice_id: str, api_keys: List[str]) -> str:
             continue
     return "None"
 
+
+# --- deep search helpers for nested payloads ---
+def _deep_find_first(obj, key_set_lower) -> Optional[str]:
+    """
+    Recursively search dict/list for the first value whose key (case-insensitive)
+    is in key_set_lower. Returns string value if found, else None.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k and k.lower() in key_set_lower and v not in (None, "", []):
+                return str(v)
+        for v in obj.values():
+            res = _deep_find_first(v, key_set_lower)
+            if res is not None:
+                return res
+    elif isinstance(obj, list):
+        for it in obj:
+            res = _deep_find_first(it, key_set_lower)
+            if res is not None:
+                return res
+    return None
+
+
 def _pick_response_date(rec: Dict[str, Any], detail: Dict[str, Any]) -> str:
     """
-    SAM may surface the due/response date under several keys & levels.
-    We check both the main record and the fetched detail.
+    Find the response/due date across common and nested keys, prefer dueDate.
+    Normalize to YYYY-MM-DD when possible.
     """
-    candidates = [
-    "dueDate", "responseDueDate", "closeDate", "responseDate", "responseDateTime",
-    ]
-    for src in (rec, detail):
-        for k in candidates:
-            val = src.get(k)
-            if val not in (None, "", []):
-                return str(val)
-        # shallow nested maps
-        for v in src.values():
-            if isinstance(v, dict):
-                for k in candidates:
-                    if v.get(k):
-                        return str(v[k])
-    return "None"
+    candidates = {
+        "duedate", "responseduedate", "closedate",
+        "responsedate", "responsedatetime",
+        "offersduedate", "proposalduedate"
+    }
+
+    # Try the main record first
+    found = _deep_find_first(rec, candidates)
+    # If not there, try the detail payload
+    if not found and detail:
+        found = _deep_find_first(detail, candidates)
+
+    return _normalize_date(found) if found else "None"
+
 
 def _first_nonempty(obj: Dict[str, Any], *keys: str, default: str = "None") -> str:
     for k in keys:
         v = obj.get(k)
         if isinstance(v, dict):
             # pick common subkeys if dict
-            for sub in ("name","value","code","text"):
+            for sub in ("name", "value", "code", "text"):
                 if v.get(sub):
                     return str(v[sub])
             continue
         if v is not None and str(v).strip() != "":
             return str(v)
     return default
+
 
 def map_record_allowed_fields(
     rec: Dict[str, Any],
@@ -293,37 +357,34 @@ def map_record_allowed_fields(
     if link == "None":
         link = _first_nonempty(rec, "url", "samLink")
 
-    # detail & description
-    detail = {}
+    # detail (for response_date / description) – fetch once
+    detail: Dict[str, Any] = {}
     if fetch_desc and api_keys and notice_id != "None":
         detail = fetch_notice_detail_v2(notice_id, api_keys)
 
-    # response_date from rec or detail
+    # response_date: prefer SAM's dueDate (via _pick_response_date)
     response_date = _pick_response_date(rec, detail)
 
-    # description from inline/rec first
+    # description: prefer inline; if missing/URL, use detail, then noticedesc
     description = _first_nonempty(rec, "description", "synopsis", default="")
+
     def _looks_like_placeholder_or_url(t: str) -> bool:
-        if not t: return True
+        if not t:
+            return True
         s = t.strip().lower()
-        if s in ("none","n/a","na"): return True
-        return s.startswith("http://") or s.startswith("https://")
+        return s in ("none", "n/a", "na") or s.startswith("http://") or s.startswith("https://")
 
     if _looks_like_placeholder_or_url(description):
-        if fetch_desc and api_keys and notice_id != "None":
-            # try v2 detail first (it may include full text), else noticedesc
-            detail_text = ""
-            detail = fetch_notice_detail_v2(notice_id, api_keys)
-            for k in ("description","synopsis","longDescription","fullDescription","additionalInfo"):
+        detail_text = ""
+        if detail:  # try any long/expanded fields from detail
+            for k in ("description", "synopsis", "longDescription", "fullDescription", "additionalInfo"):
                 val = detail.get(k)
                 if val and str(val).strip():
                     detail_text = re.sub(r"\s+", " ", str(val)).strip()
                     break
-            if not detail_text:
-                detail_text = fetch_notice_description(notice_id, api_keys)
-            description = detail_text if detail_text else "None"
-        else:
-            description = "None"
+        if not detail_text and fetch_desc and api_keys and notice_id != "None":
+            detail_text = fetch_notice_description(notice_id, api_keys)
+        description = detail_text if detail_text else "None"
 
     return {
         "notice_id":            notice_id,
@@ -338,23 +399,3 @@ def map_record_allowed_fields(
         "description":          description,
         "link":                 link,
     }
-
-def _deep_get(obj: Any, candidates: List[str]) -> Optional[str]:
-    """
-    Try to find a value for any of the candidate keys, including if nested under dicts.
-    Returns the first non-empty string found.
-    """
-    if not isinstance(obj, dict):
-        return None
-    # direct
-    for k in candidates:
-        v = obj.get(k)
-        if v not in (None, "", []):
-            return str(v)
-    # shallow nested search
-    for v in obj.values():
-        if isinstance(v, dict):
-            found = _deep_get(v, candidates)
-            if found:
-                return found
-    return None
