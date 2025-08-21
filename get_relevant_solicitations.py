@@ -298,25 +298,47 @@ def _deep_find_first(obj, key_set_lower) -> Optional[str]:
     return None
 
 
-def _pick_response_date(rec: Dict[str, Any], detail: Dict[str, Any]) -> str:
+def _pick_response_date(rec: dict, detail: dict) -> str:
     """
-    Find the response/due date across common and nested keys, prefer dueDate.
+    Prefer v2 'reponseDeadLine' (typoed in SAM docs/spec), then try common fallbacks.
     Normalize to YYYY-MM-DD when possible.
     """
-    candidates = {
-        "duedate", "responseduedate", "closedate",
-        "responsedate", "responsedatetime",
-        "offersduedate", "proposalduedate"
-    }
+    # primary per v2 spec
+    preferred = rec.get("reponseDeadLine")
+    if preferred:
+        return _normalize_date(preferred)
 
-    # Try the main record first
-    found = _deep_find_first(rec, candidates)
-    # If not there, try the detail payload
-    if not found and detail:
-        found = _deep_find_first(detail, candidates)
+    # try detail payload too
+    preferred = detail.get("reponseDeadLine") if isinstance(detail, dict) else None
+    if preferred:
+        return _normalize_date(preferred)
 
-    return _normalize_date(found) if found else "None"
+    # conservative fallbacks seen in the wild / legacy payloads
+    candidates = [
+        "responseDeadLine",      # sometimes appears correctly spelled in some payloads
+        "responseDueDate",
+        "dueDate",
+        "closeDate",
+        "responseDate",
+        "responseDateTime",
+        "offersDueDate",
+        "proposalDueDate",
+    ]
 
+    for src in (rec, detail if isinstance(detail, dict) else {}):
+        for k in candidates:
+            val = src.get(k)
+            if val not in (None, "", []):
+                return _normalize_date(val)
+
+        # shallow nested dicts
+        for v in src.values():
+            if isinstance(v, dict):
+                for k in candidates:
+                    if v.get(k):
+                        return _normalize_date(v[k])
+
+    return "None"
 
 def _first_nonempty(obj: Dict[str, Any], *keys: str, default: str = "None") -> str:
     for k in keys:
