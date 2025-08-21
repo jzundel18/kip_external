@@ -6,7 +6,6 @@ from datetime import date, timedelta
 from typing import List, Dict, Any, Optional
 import requests, time, html, re
 
-
 # Production v2 endpoint (per current docs)
 SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
 SAM_DESC_URL_V1 = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
@@ -171,52 +170,177 @@ def _rotate_keys(keys: List[str]):
         for k in keys:
             yield k
 
-def fetch_notice_description(notice_id: str, api_keys: List[str], timeout: int = 25) -> str:
+
+
+SAM_SEARCH_URL_V2 = "https://api.sam.gov/prod/opportunities/v2/search"
+SAM_DESC_URL_V1   = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
+
+def _rotate_keys(keys: List[str]):
+    while True:
+        for k in keys:
+            yield k
+
+def _http_get(url: str, params: dict, key: str, timeout: int = 30) -> requests.Response:
+    headers = {"User-Agent": "kip_external/1.0"}
+    return requests.get(url, params={**params, "api_key": key}, headers=headers, timeout=timeout)
+
+def fetch_notice_detail_v2(notice_id: str, api_keys: List[str]) -> Dict[str, Any]:
     """
-    Fetch the full solicitation description from SAM noticedesc endpoint.
-    Returns plain text. If it fails across all keys, returns ''.
+    Try to fetch a *single* record using the v2 search endpoint by noticeid.
+    Returns {} on failure.
     """
     if not notice_id or not api_keys:
-        return ""
-    keys = _rotate_keys(api_keys)
+        return {}
+    rot = _rotate_keys(api_keys)
     last_exc = None
-    # Try up to len(api_keys) attempts rotating keys
     for _ in range(len(api_keys)):
-        key = next(keys)
+        key = next(rot)
         try:
-            r = requests.get(
-                SAM_DESC_URL_V1,
-                params={"noticeid": notice_id, "api_key": key},
-                timeout=timeout,
-            )
+            r = _http_get(SAM_SEARCH_URL_V2, {"noticeid": notice_id, "limit": 1}, key)
             if r.status_code == 429:
-                time.sleep(1.0)
-                continue
+                time.sleep(1.0); continue
             r.raise_for_status()
-            # noticedesc often returns HTML or text; normalize to plain text
-            text = r.text or ""
-            text = html.unescape(text)
-            text = re.sub(r"<[^>]+>", " ", text)        # strip tags
-            text = re.sub(r"\s+", " ", text).strip()     # collapse whitespace
-            return text
+            data = r.json() if r.headers.get("Content-Type","").startswith("application/json") else {}
+            # v2 payload typically under "opportunitiesData"
+            items = data.get("opportunitiesData") or data.get("data") or []
+            if isinstance(items, list) and items:
+                return items[0]
+            return {}
         except Exception as e:
             last_exc = e
             time.sleep(0.5)
             continue
-    return ""
+    return {}
+
+def fetch_notice_description(notice_id: str, api_keys: List[str]) -> str:
+    """
+    Get full description text using two strategies:
+      1) v2 detail (if it includes description/synopsis/long text)
+      2) v1 noticedesc (HTML/plain -> normalized text)
+    Returns 'None' if both fail.
+    """
+    # 1) try v2 detail
+    detail = fetch_notice_detail_v2(notice_id, api_keys)
+    for k in ("description","synopsis","longDescription","fullDescription","additionalInfo"):
+        val = detail.get(k)
+        if val and str(val).strip():
+            return re.sub(r"\s+", " ", str(val)).strip()
+
+    # 2) v1 noticedesc
+    rot = _rotate_keys(api_keys)
+    for _ in range(len(api_keys)):
+        key = next(rot)
+        try:
+            r = _http_get(SAM_DESC_URL_V1, {"noticeid": notice_id}, key)
+            if r.status_code == 429:
+                time.sleep(1.0); continue
+            r.raise_for_status()
+            text = r.text or ""
+            text = html.unescape(text)
+            text = re.sub(r"<[^>]+>", " ", text)     # strip tags
+            text = re.sub(r"\s+", " ", text).strip() # collapse whitespace
+            if text:
+                return text
+        except Exception:
+            time.sleep(0.5)
+            continue
+    return "None"
+
+def _pick_response_date(rec: Dict[str, Any], detail: Dict[str, Any]) -> str:
+    """
+    SAM may surface the due/response date under several keys & levels.
+    We check both the main record and the fetched detail.
+    """
+    candidates = [
+        "responseDate", "responseDueDate", "closeDate", "dueDate", "responseDateTime",
+        # sometimes nested under 'dates' or similar
+    ]
+    for src in (rec, detail):
+        for k in candidates:
+            val = src.get(k)
+            if val not in (None, "", []):
+                return str(val)
+        # shallow nested maps
+        for v in src.values():
+            if isinstance(v, dict):
+                for k in candidates:
+                    if v.get(k):
+                        return str(v[k])
+    return "None"
 
 def _first_nonempty(obj: Dict[str, Any], *keys: str, default: str = "None") -> str:
     for k in keys:
         v = obj.get(k)
         if isinstance(v, dict):
-            # common nested conventions
-            for sub in ("name", "value", "code"):
+            # pick common subkeys if dict
+            for sub in ("name","value","code","text"):
                 if v.get(sub):
                     return str(v[sub])
             continue
         if v is not None and str(v).strip() != "":
             return str(v)
     return default
+
+def map_record_allowed_fields(
+    rec: Dict[str, Any],
+    *,
+    api_keys: Optional[List[str]] = None,
+    fetch_desc: bool = True
+) -> Dict[str, Any]:
+    notice_id            = _first_nonempty(rec, "noticeId", "id")
+    solicitation_number  = _first_nonempty(rec, "solicitationNumber", "solicitationNo")
+    title                = _first_nonempty(rec, "title")
+    notice_type          = _first_nonempty(rec, "noticeType", "type")
+    posted_date          = _first_nonempty(rec, "postedDate", "publicationDate")
+    archive_date         = _first_nonempty(rec, "archiveDate")
+    naics_code           = _first_nonempty(rec, "naicsCode", "naics")
+    set_aside_code       = _first_nonempty(rec, "setAsideCode", "typeOfSetAside", "setAside")
+
+    # link (handy reference)
+    link = "None"
+    links = rec.get("links")
+    if isinstance(links, list) and links:
+        maybe = links[0]
+        if isinstance(maybe, dict) and maybe.get("href"):
+            link = str(maybe["href"])
+    if link == "None":
+        link = _first_nonempty(rec, "url", "samLink")
+
+    # detail & description
+    detail = {}
+    if fetch_desc and api_keys and notice_id != "None":
+        detail = fetch_notice_detail_v2(notice_id, api_keys)
+
+    # response_date from rec or detail
+    response_date = _pick_response_date(rec, detail)
+
+    # description from inline/rec first
+    description = _first_nonempty(rec, "description", "synopsis", default="")
+    def _looks_like_placeholder_or_url(t: str) -> bool:
+        if not t: return True
+        s = t.strip().lower()
+        if s in ("none","n/a","na"): return True
+        return s.startswith("http://") or s.startswith("https://")
+
+    if _looks_like_placeholder_or_url(description):
+        if fetch_desc and api_keys and notice_id != "None":
+            description = fetch_notice_description(notice_id, api_keys)
+        else:
+            description = "None"
+
+    return {
+        "notice_id":            notice_id,
+        "solicitation_number":  solicitation_number,
+        "title":                title,
+        "notice_type":          notice_type,
+        "posted_date":          posted_date,
+        "response_date":        response_date,
+        "archive_date":         archive_date,
+        "naics_code":           naics_code,
+        "set_aside_code":       set_aside_code,
+        "description":          description,
+        "link":                 link,
+    }
 
 def _deep_get(obj: Any, candidates: List[str]) -> Optional[str]:
     """
@@ -237,73 +361,3 @@ def _deep_get(obj: Any, candidates: List[str]) -> Optional[str]:
             if found:
                 return found
     return None
-
-def map_record_allowed_fields(rec: Dict[str, Any], *, api_keys: Optional[List[str]] = None, fetch_desc: bool = True) -> Dict[str, Any]:
-    """
-    Return ONLY the fields your DB persists now.
-    - Ensures response_date finds common variants (responseDate, closeDate, responseDueDate, etc.)
-    - Ensures description is real text (fetches noticedesc if missing/URL/placeholder)
-    - Keeps set_aside_code logic you liked
-    - Drops agency / organization_name
-    """
-    notice_id = _first_nonempty(rec, "noticeId", "id")
-
-    # title / notice type / sol num
-    title               = _first_nonempty(rec, "title")
-    notice_type         = _first_nonempty(rec, "noticeType", "type")
-    solicitation_number = _first_nonempty(rec, "solicitationNumber", "solicitationNo")
-
-    # dates (robust)
-    posted_date   = _first_nonempty(rec, "postedDate", "publicationDate")
-    response_date = (_deep_get(rec, ["responseDate", "closeDate", "responseDueDate", "responseDateTime"]) 
-                     or "None")
-    archive_date  = _first_nonempty(rec, "archiveDate")
-
-    # NAICS / set-aside
-    naics_code     = _first_nonempty(rec, "naicsCode", "naics")
-    set_aside_code = _first_nonempty(rec, "setAsideCode", "typeOfSetAside", "setAside")
-
-    # link (still useful for reference)
-    link = "None"
-    links = rec.get("links")
-    if isinstance(links, list) and links:
-        maybe = links[0]
-        if isinstance(maybe, dict) and maybe.get("href"):
-            link = str(maybe["href"])
-    if link == "None":
-        link = _first_nonempty(rec, "url", "samLink")
-
-    # description:
-    # 1) take inline if provided and not just "None"/URL-ish
-    # 2) otherwise fetch from noticedesc (if keys provided)
-    description = _first_nonempty(rec, "description", "synopsis", default="")
-    def _is_placeholder_or_url(txt: str) -> bool:
-        if not txt: 
-            return True
-        t = txt.strip().lower()
-        if t in ("none", "n/a", "na"):
-            return True
-        if t.startswith("http://") or t.startswith("https://"):
-            return True
-        return False
-
-    if _is_placeholder_or_url(description):
-        if fetch_desc and api_keys and notice_id != "None":
-            fetched = fetch_notice_description(notice_id, api_keys)
-            description = fetched if fetched else "None"
-        else:
-            description = "None"
-
-    return {
-        "notice_id":            notice_id,
-        "solicitation_number":  solicitation_number,
-        "title":                title,
-        "notice_type":          notice_type,
-        "posted_date":          posted_date,
-        "response_date":        response_date,
-        "archive_date":         archive_date,
-        "naics_code":           naics_code,
-        "set_aside_code":       set_aside_code,
-        "description":          description,
-        "link":                 link,
-    }
