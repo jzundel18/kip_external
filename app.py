@@ -1,3 +1,5 @@
+# app.py
+
 import os
 import re
 import json
@@ -6,121 +8,20 @@ from sqlalchemy import inspect
 import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import text
-from sqlalchemy.engine.url import make_url
 import streamlit as st
-from datetime import date
-from sqlmodel import SQLModel, Field, Session, create_engine, select
-
+from datetime import date, datetime, timezone
+from sqlmodel import SQLModel, Field, create_engine
 import numpy as np
 from openai import OpenAI
-def ai_make_blurbs(
-    df: pd.DataFrame,
-    api_key: str,
-    model: str = "gpt-4o-mini",
-    max_items: int = 200,
-) -> dict[str, str]:
-    """
-    Returns {notice_id: blurb}. Each blurb is a super short, plain-English summary
-    of what the solicitation is for (title + description distilled).
-    """
-    if df is None or df.empty:
-        return {}
 
-    # Build compact payload (cap items to keep prompt small)
-    cols = ["notice_id", "title", "description"]
-    use = df[[c for c in cols if c in df.columns]].head(max_items).copy()
-    items = []
-    for _, r in use.iterrows():
-        items.append({
-            "notice_id": str(r.get("notice_id", "")),
-            "title": (r.get("title") or "")[:300],
-            "description": (r.get("description") or "")[:2000],
-        })
-
-    system_msg = (
-        "You are helping a contracts analyst. For each item, write a single, "
-        "very short blurb (max ~12 words) summarizing what the solicitation buys/needs. "
-        "Plain English, no fluff, no NAICS/set-aside boilerplate, no agency names, "
-        "no punctuation at the end if not needed."
-    )
-    user_msg = {
-        "items": items,
-        "format": 'Return JSON: {"blurbs":[{"notice_id":"...","blurb":"..."}]} with the same order.'
-    }
-
-    client = OpenAI(api_key=api_key)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_msg)},
-            ],
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
-        out = {}
-        for row in data.get("blurbs", []):
-            nid = str(row.get("notice_id", "")).strip()
-            blurb = (row.get("blurb") or "").strip()
-            if nid and blurb:
-                out[nid] = blurb
-        return out
-    except Exception as e:
-        st.warning(f"Could not generate blurbs right now ({e}). Showing titles instead.")
-        return {}
-def ai_downselect_df(company_desc: str, df: pd.DataFrame, api_key: str,
-                     threshold: float = 0.20, top_k: int | None = None) -> pd.DataFrame:
-    """
-    Compute cosine similarity between company_desc and each row's (title + description).
-    Keep rows with similarity >= threshold. Optionally keep only top_k.
-    """
-    if df.empty:
-        return df
-
-    # Build texts to embed
-    texts = (df["title"].fillna("") + " " + df["description"].fillna("")).str.slice(0, 3000).tolist()
-
-    try:
-        client = OpenAI(api_key=api_key)
-        # Get embeddings for company & rows (text-embedding-3-small is cheap & good)
-        q = client.embeddings.create(model="text-embedding-3-small", input=[company_desc])
-        Xq = np.array(q.data[0].embedding, dtype=np.float32)
-
-        r = client.embeddings.create(model="text-embedding-3-small", input=texts)
-        X = np.array([d.embedding for d in r.data], dtype=np.float32)
-
-        # cosine similarity
-        Xq_norm = Xq / (np.linalg.norm(Xq) + 1e-9)
-        X_norm = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
-        sims = X_norm @ Xq_norm
-
-        df = df.copy()
-        df["ai_score"] = sims
-
-        if top_k is not None and top_k > 0:
-            df = df.sort_values("ai_score", ascending=False).head(int(top_k))
-        else:
-            df = df[df["ai_score"] >= float(threshold)].sort_values("ai_score", ascending=False)
-
-        return df.reset_index(drop=True)
-
-    except Exception as e:
-        st.warning(f"AI downselect unavailable right now ({e}). Falling back to simple keyword filter.")
-        # crude fallback: any word from company desc appearing in title/description
-        kws = [w.lower() for w in re.findall(r"[a-zA-Z0-9]{4,}", company_desc)]
-        if not kws:
-            return df
-        blob = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
-        mask = blob.apply(lambda t: any(k in t for k in kws))
-        return df[mask].reset_index(drop=True)
 # =========================
-# Streamlit page & helpers
+# Streamlit page
 # =========================
 st.set_page_config(page_title="GovContract Assistant MVP", layout="wide")
 
+# =========================
+# Small helpers
+# =========================
 def normalize_naics_input(text_in: str) -> list[str]:
     if not text_in:
         return []
@@ -155,7 +56,7 @@ def get_secret(name, default=None):
         return st.secrets[name]
     return os.getenv(name, default)
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 SERP_API_KEY   = get_secret("SERP_API_KEY")
 SAM_KEYS       = get_secret("SAM_KEYS", [])
 
@@ -208,13 +109,13 @@ except Exception as e:
     st.stop()
 
 # =========================
-# Static schema: ONLY the attributes you want to persist
+# Static schema (only the fields you want)
 # =========================
 class SolicitationRaw(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    pulled_at: Optional[str] = Field(default=None, index=True)
+    pulled_at: Optional[str] = Field(default=None, index=True)  # when we pulled from SAM
     notice_id: str = Field(index=True, nullable=False, unique=True)
 
     solicitation_number: Optional[str] = None
@@ -232,10 +133,9 @@ class SolicitationRaw(SQLModel, table=True):
     link: Optional[str] = None
 
 # Create table
-# --- create base table defined by SQLModel ---
 SQLModel.metadata.create_all(engine)
 
-# --- lightweight migration: ensure required columns & unique index exist ---
+# Lightweight migration: ensure columns & unique index
 REQUIRED_COLS = {
     "pulled_at": "TEXT",
     "notice_id": "TEXT",
@@ -250,7 +150,6 @@ REQUIRED_COLS = {
     "description": "TEXT",
     "link": "TEXT",
 }
-
 try:
     insp = inspect(engine)
     existing_cols = {c["name"] for c in insp.get_columns("solicitationraw")}
@@ -259,18 +158,14 @@ try:
     if missing_cols:
         with engine.begin() as conn:
             for col in missing_cols:
-                # explicit quoting to handle lowercase names
                 conn.execute(sa.text(f'ALTER TABLE solicitationraw ADD COLUMN "{col}" {REQUIRED_COLS[col]}'))
 
-    # Create unique index on notice_id if not present (Postgres supports IF NOT EXISTS)
     with engine.begin() as conn:
         conn.execute(sa.text("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_solicitationraw_notice_id
             ON solicitationraw (notice_id)
         """))
-
 except Exception as e:
-    # If you're on SQLite or hit a permission quirk, show a helpful error
     st.warning(f"Migration note: {e}")
 
 # =========================
@@ -278,6 +173,7 @@ except Exception as e:
 # =========================
 import get_relevant_solicitations as gs
 from get_relevant_solicitations import SamQuotaError, SamAuthError, SamBadRequestError
+
 import find_relevant_suppliers as fs
 import generate_proposal as gp
 
@@ -296,38 +192,169 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Tips")
     st.write("• Refresh writes only brand-new notice_ids to the DB (no updates).")
-    st.write("• Filter below uses DB only (no extra SAM calls).")
+    st.write("• Filters below hit your DB only (no extra SAM calls).")
 
 # =========================
-# Upsert-only-new helpers
+# AI helpers
 # =========================
-# exactly what you store now
+def ai_downselect_df(company_desc: str, df: pd.DataFrame, api_key: str,
+                     threshold: float = 0.20, top_k: int | None = None) -> pd.DataFrame:
+    """
+    Embedding-based similarity between company_desc and (title + description).
+    Keep rows with similarity >= threshold, or top_k if provided.
+    """
+    if df.empty:
+        return df
+
+    texts = (df["title"].fillna("") + " " + df["description"].fillna("")).str.slice(0, 2000).tolist()
+    try:
+        client = OpenAI(api_key=api_key)
+        q = client.embeddings.create(model="text-embedding-3-small", input=[company_desc])
+        Xq = np.array(q.data[0].embedding, dtype=np.float32)
+
+        r = client.embeddings.create(model="text-embedding-3-small", input=texts)
+        X = np.array([d.embedding for d in r.data], dtype=np.float32)
+
+        Xq_norm = Xq / (np.linalg.norm(Xq) + 1e-9)
+        X_norm = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+        sims = X_norm @ Xq_norm
+
+        df = df.copy()
+        df["ai_score"] = sims
+
+        if top_k is not None and top_k > 0:
+            df = df.sort_values("ai_score", ascending=False).head(int(top_k))
+        else:
+            df = df[df["ai_score"] >= float(threshold)].sort_values("ai_score", ascending=False)
+
+        return df.reset_index(drop=True)
+
+    except Exception as e:
+        st.warning(f"AI downselect unavailable right now ({e}). Falling back to simple keyword filter.")
+        kws = [w.lower() for w in re.findall(r"[a-zA-Z0-9]{4,}", company_desc)]
+        if not kws:
+            return df
+        blob = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
+        mask = blob.apply(lambda t: any(k in t for k in kws))
+        return df[mask].reset_index(drop=True)
+
+def _chunk(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
+
+def ai_make_blurbs(
+    df: pd.DataFrame,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+    max_items: int = 160,
+    chunk_size: int = 40,
+) -> dict[str, str]:
+    """
+    Returns {notice_id: blurb}. Short plain-English summaries of solicitations.
+    Batches requests to keep prompts small & reliable.
+    """
+    if df is None or df.empty:
+        return {}
+
+    cols = ["notice_id", "title", "description"]
+    use = df[[c for c in cols if c in df.columns]].head(max_items).copy()
+
+    # Prepare items (truncate to keep prompt tight)
+    items = []
+    for _, r in use.iterrows():
+        items.append({
+            "notice_id": str(r.get("notice_id", "")),
+            "title": (r.get("title") or "")[:200],
+            "description": (r.get("description") or "")[:800],  # keep short to avoid token bloat
+        })
+
+    client = OpenAI(api_key=api_key)
+    out: dict[str, str] = {}
+
+    system_msg = (
+        "You are helping a contracts analyst. For each item, write one very short, "
+        "plain-English blurb (~8–12 words) summarizing what the solicitation buys/needs. "
+        "Avoid agency names, set-aside boilerplate, and extra punctuation."
+    )
+
+    for batch in _chunk(items, chunk_size):
+        user_msg = {
+            "items": batch,
+            "format": 'Return JSON: {"blurbs":[{"notice_id":"...","blurb":"..."}]} in the same order.'
+        }
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": json.dumps(user_msg)},
+                ],
+                temperature=0.2,
+            )
+            content = resp.choices[0].message.content or "{}"
+            data = json.loads(content)
+            for row in data.get("blurbs", []):
+                nid = str(row.get("notice_id", "")).strip()
+                blurb = (row.get("blurb") or "").strip()
+                if nid and blurb:
+                    out[nid] = blurb
+        except Exception as e:
+            # If a batch fails, skip it but continue with others
+            st.warning(f"Could not generate blurbs for one batch ({e}).")
+            continue
+
+    return out
+
+# =========================
+# DB helpers
+# =========================
 COLS_TO_SAVE = [
     "notice_id","solicitation_number","title","notice_type",
     "posted_date","response_date","archive_date",
     "naics_code","set_aside_code",
     "description","link"
 ]
+
+DISPLAY_COLS = [
+    # For UI we will *exclude* notice_id and description, but they remain selectable below
+    "pulled_at",
+    "solicitation_number",
+    "notice_type",
+    "posted_date",
+    "response_date",
+    "naics_code",
+    "set_aside_code",
+    "link",
+    # (notice_id and description are intentionally not shown in UI, but exist in the DF).
+]
+
 def insert_new_records_only(records) -> int:
+    """
+    Maps raw SAM records, adds pulled_at, and inserts only new notice_ids.
+    """
     if not records:
         return 0
 
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = []
     for r in records:
-        m = gs.map_record_allowed_fields(r, api_keys=SAM_KEYS, fetch_desc=True)        
+        m = gs.map_record_allowed_fields(r, api_keys=SAM_KEYS, fetch_desc=True)
         nid = (m.get("notice_id") or "").strip()
         if not nid:
             continue
-        rows.append({k: (m.get(k) or "") for k in COLS_TO_SAVE})
+        row = {k: (m.get(k) or "") for k in COLS_TO_SAVE}
+        row["pulled_at"] = now_iso
+        rows.append(row)
 
     if not rows:
         return 0
 
     sql = sa.text(f"""
         INSERT INTO solicitationraw (
-            {", ".join(COLS_TO_SAVE)}
+            pulled_at, {", ".join(COLS_TO_SAVE)}
         ) VALUES (
-            {", ".join(":"+c for c in COLS_TO_SAVE)}
+            :pulled_at, {", ".join(":"+c for c in COLS_TO_SAVE)}
         )
         ON CONFLICT (notice_id) DO NOTHING
     """)
@@ -336,20 +363,20 @@ def insert_new_records_only(records) -> int:
         conn.execute(sql, rows)  # bulk insert
 
     return len(rows)
-DISPLAY_COLS = [
-    "pulled_at","notice_id","solicitation_number","title","notice_type",
-    "posted_date","response_date","archive_date",
-    "naics_code","set_aside_code","description","link"
-]
 
 def query_filtered_df(filters: dict) -> pd.DataFrame:
+    # Pull a superset of columns; we'll hide some in the UI
+    base_cols = ["pulled_at","notice_id","solicitation_number","title","notice_type",
+                 "posted_date","response_date","archive_date",
+                 "naics_code","set_aside_code","description","link"]
+
     with engine.connect() as conn:
-        df = pd.read_sql_query(f"SELECT {', '.join(DISPLAY_COLS)} FROM solicitationraw", conn)
+        df = pd.read_sql_query(f"SELECT {', '.join(base_cols)} FROM solicitationraw", conn)
 
     if df.empty:
         return df
 
-    # keyword OR filter (guard for missing description/title just in case)
+    # keyword OR filter
     kws = [k.lower() for k in (filters.get("keywords_or") or []) if k]
     if kws:
         title = df["title"].fillna("")
@@ -408,7 +435,6 @@ with colR1:
             st.exception(e)
 
 with colR2:
-    # Show count of rows currently in DB
     try:
         with engine.connect() as conn:
             cnt = pd.read_sql_query("SELECT COUNT(*) AS c FROM solicitationraw", conn)["c"].iloc[0]
@@ -424,9 +450,9 @@ if "sol_df" not in st.session_state:
 if "sup_df" not in st.session_state:
     st.session_state.sup_df = None
 
-import json
-from openai import OpenAI
-
+# =========================
+# AI ranker (used for the Top 5 expander section)
+# =========================
 def ai_rank_solicitations_by_fit(
     df: pd.DataFrame,
     company_desc: str,
@@ -435,9 +461,6 @@ def ai_rank_solicitations_by_fit(
     max_candidates: int = 100,
     model: str = "gpt-4o-mini",
 ) -> list[dict]:
-    """
-    Returns: [{"notice_id": "...", "score": 0-100, "reason": "..."}] ordered best→worst.
-    """
     if df is None or df.empty:
         return []
 
@@ -452,7 +475,7 @@ def ai_rank_solicitations_by_fit(
         items.append({
             "notice_id": str(r.get("notice_id", "")),
             "title": str(r.get("title", ""))[:300],
-            "description": str(r.get("description", ""))[:3000],
+            "description": str(r.get("description", ""))[:1500],
             "naics_code": str(r.get("naics_code", "")),
             "set_aside_code": str(r.get("set_aside_code", "")),
             "response_date": str(r.get("response_date", "")),
@@ -462,7 +485,7 @@ def ai_rank_solicitations_by_fit(
 
     system_msg = (
         "You are a contracts analyst. Rank solicitations by how well they match the company description. "
-        "Consider title, description, NAICS, set-aside, and due date recency. Prefer clear technical/mission fit."
+        "Consider title, description, NAICS, set-aside, and due date recency."
     )
     user_msg = {
         "company_description": company_desc,
@@ -486,14 +509,12 @@ def ai_rank_solicitations_by_fit(
     )
     content = resp.choices[0].message.content
 
-    # Parse JSON safely
     try:
         data = json.loads(content or "{}")
         ranked = data.get("ranked", [])
     except Exception:
         return []
 
-    # Keep only rows that exist in df2; sort and dedupe
     keep_ids = set(df2["notice_id"].astype(str).tolist())
     cleaned = []
     for item in ranked:
@@ -542,117 +563,69 @@ with tab1:
                 ["Solicitation","Combined Synopsis/Solicitation","Sources Sought","Special Notice","SRCSGT","RFI"]
             )
 
-    filters = {
-        "keywords_or": parse_keywords_or(keywords_raw),
-        "naics": normalize_naics_input(naics_raw),
-        "set_asides": set_asides,
-        "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
-        "notice_types": notice_types,
-    }
     st.subheader("Company profile (optional)")
     company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
+    ai_threshold = st.slider("AI match threshold", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Higher = stricter")
 
-    # One-button flow: manual filters always; optional AI ranking (top 5) when checkbox + description
+    # One-button flow
     if st.button("Show top results", type="primary", key="btn_show_results"):
         try:
-            # 1) Apply manual filters from DB (no SAM calls)
+            # 1) Manual filters against the DB
+            filters = {
+                "keywords_or": parse_keywords_or(keywords_raw),
+                "naics": normalize_naics_input(naics_raw),
+                "set_asides": set_asides,
+                "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
+                "notice_types": notice_types,
+            }
             df = query_filtered_df(filters)
 
             if df.empty:
                 st.warning("No solicitations match your filters. Try adjusting filters or refresh today's feed.")
             else:
-                # --- NEW: ask AI for tiny blurbs to show instead of raw titles
-                blurbs = ai_make_blurbs(df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=200)
-                if blurbs:
-                    df = df.copy()
-                    df["blurb"] = df["notice_id"].astype(str).map(blurbs).fillna(df["title"].fillna(""))
-                    # Put blurb up front for visibility in the table
-                    front = ["blurb"]
-                    rest = [c for c in df.columns if c not in front]
-                    df = df[front + rest]
-                st.session_state.sol_df = df
-                st.success(f"Found {len(df)} solicitations.")
-
-                # 2) If AI downselect is checked & description present, rank & show top 5 (title-first, expandable details)
+                # 2) Optional AI downselect by embeddings
                 if use_ai_downselect and company_desc.strip():
-                    with st.spinner("Ranking top matches with AI…"):
-                        ranked = ai_rank_solicitations_by_fit(
-                            df=st.session_state.sol_df,
-                            company_desc=company_desc.strip(),
-                            api_key=OPENAI_API_KEY,
-                            top_k=5,
-                            max_candidates=100,   # adjust cost/speed as you like
-                            model="gpt-4o-mini",
-                        )
+                    df = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY, threshold=ai_threshold)
 
-                    if not ranked:
-                        st.info("AI ranking returned no results; showing the manually filtered table instead.")
-                        # Show the table
-                        show_df = st.session_state.sol_df.head(int(limit_results)) if limit_results else st.session_state.sol_df
-                        st.subheader(f"Solicitations ({len(show_df)})")
-                        st.dataframe(show_df, use_container_width=True)
-                        st.download_button(
-                            "Download filtered as CSV",
-                            show_df.to_csv(index=False).encode("utf-8"),
-                            file_name="sol_list.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        # Build a quick lookup for details by notice_id
-                        base_df = st.session_state.sol_df
-                        idx_by_id = {str(x): i for i, x in enumerate(base_df["notice_id"].astype(str).tolist())}
+                # 3) Generate super-short blurbs (batched); fallback to title if not available
+                blurbs = ai_make_blurbs(df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=160, chunk_size=40)
+                df = df.copy()
+                df["blurb"] = df["notice_id"].astype(str).map(blurbs).fillna(df["title"].fillna(""))
 
-                        # Compose a small DataFrame for download (top-5 ranked rows)
-                        top_rows = []
-                        st.success(f"Top {len(ranked)} matches by company fit:")
-                        for i, item in enumerate(ranked, start=1):
-                            nid = item["notice_id"]
-                            score = int(round(item.get("score", 0)))
-                            reason = item.get("reason", "")
-                            row = base_df.iloc[idx_by_id[nid]]
-
-                            # accumulate for download
-                            top_rows.append(row)
-
-                            hdr = (row.get("blurb") or row.get("title") or "Untitled")
-                            with st.expander(f"{i}. {hdr}  —  Score {score}/100"):
-                                st.write(f"**Notice Type:** {row.get('notice_type','')}")
-                                st.write(f"**Posted:** {row.get('posted_date','')}")
-                                st.write(f"**Response Due:** {row.get('response_date','')}")
-                                st.write(f"**NAICS:** {row.get('naics_code','')}")
-                                st.write(f"**Set-aside:** {row.get('set_aside_code','')}")
-                                link = row.get("link","")
-                                if link:
-                                    st.write(f"**Link:** {link}")
-                                if reason:
-                                    st.markdown("**Why this matched (AI):**")
-                                    st.info(reason)
-
-                        # Offer download of just the top-5
-                        if top_rows:
-                            top_df = pd.DataFrame(top_rows).reset_index(drop=True)
-                            st.download_button(
-                                "Download Top-5 (AI-ranked) as CSV",
-                                top_df.to_csv(index=False).encode("utf-8"),
-                                file_name="top5_ai_ranked.csv",
-                                mime="text/csv"
-                            )
-
+                # 4) Stash final filtered DF; then show limited rows
+                st.session_state.sol_df = df
+                if limit_results and not df.empty:
+                    df_show = df.head(int(limit_results))
                 else:
-                    # 3) No AI requested; show the manually filtered table (capped by limit_results)
-                    show_df = st.session_state.sol_df.head(int(limit_results)) if limit_results else st.session_state.sol_df
-                    st.subheader(f"Solicitations ({len(show_df)})")
-                    st.dataframe(show_df, use_container_width=True)
-                    st.download_button(
-                        "Download filtered as CSV",
-                        show_df.to_csv(index=False).encode("utf-8"),
-                        file_name="sol_list.csv",
-                        mime="text/csv"
-                    )
+                    df_show = df
+
+                # UI columns: exclude notice_id and description
+                cols_for_ui = [
+                    "blurb",
+                    "solicitation_number",
+                    "notice_type",
+                    "posted_date",
+                    "response_date",
+                    "naics_code",
+                    "set_aside_code",
+                    "link",
+                ]
+                to_show = [c for c in cols_for_ui if c in df_show.columns]
+
+                st.success(f"Found {len(df)} solicitations.")
+                st.subheader(f"Solicitations ({len(df_show)})")
+                st.dataframe(df_show[to_show], use_container_width=True)
+                st.download_button(
+                    "Download filtered as CSV",
+                    df_show[to_show].to_csv(index=False).encode("utf-8"),
+                    file_name="sol_list.csv",
+                    mime="text/csv"
+                )
 
         except Exception as e:
             st.exception(e)
+
 # ---- Tab 2
 with tab2:
     st.header("Find Supplier Suggestions")
@@ -685,12 +658,7 @@ with tab2:
 
     if st.session_state.sup_df is not None:
         st.subheader("Supplier suggestions")
-        to_show = st.session_state.sol_df.copy()
-        for col in ["notice_id", "description"]:
-            if col in to_show.columns:
-                to_show = to_show.drop(columns=[col])
-
-        st.dataframe(to_show, use_container_width=True)
+        st.dataframe(st.session_state.sup_df, use_container_width=True)
         st.download_button(
             "Download as CSV",
             st.session_state.sup_df.to_csv(index=False).encode("utf-8"),
@@ -739,4 +707,3 @@ with tab3:
 
 st.markdown("---")
 st.caption("DB schema is fixed to only the required SAM fields. Refresh inserts brand-new notices only (no updates).")
-
