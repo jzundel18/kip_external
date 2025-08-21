@@ -2,10 +2,10 @@
 # SAM.gov v2 fetchers with key rotation, clear quota/auth errors, and client-side filters.
 
 from __future__ import annotations
-import requests
 from datetime import date, timedelta
 from typing import List, Dict, Any, Optional
-import time
+import requests, time, html, re
+
 
 # Production v2 endpoint (per current docs)
 SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
@@ -165,52 +165,123 @@ def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str,
     """Back-compat alias: today's raw records with limit=N (no extra filters)."""
     return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
 
-def map_record_allowed_fields(rec: Dict[str, Any]) -> Dict[str, Any]:
-    def g(*keys: str, default: str = "") -> str:
+def map_record_allowed_fields(rec: Dict[str, Any], *, api_keys: list[str] | None = None, fetch_desc: bool = True) -> Dict[str, Any]:
+    """
+    Map a SAM /search record into the exact fields you persist.
+    If fetch_desc=True and api_keys provided, fetch full description via noticedesc.
+    When a field is not present, return the string 'None' (per your request).
+    """
+    def first_nonempty(*keys, default="None"):
         for k in keys:
             v = rec.get(k)
-            if v is not None and v != "":
+            # some fields can be nested dicts (e.g., organization)
+            if isinstance(v, dict):
+                # common nested possibilities
+                for subk in ("name", "value", "code"):
+                    if v.get(subk):
+                        return str(v[subk])
+                continue
+            if v is not None and str(v).strip() != "":
                 return str(v)
         return default
 
-    # Link: prefer links[0].href if present
-    link = ""
+    # response/close date—SAM sometimes uses responseDate or closeDate
+    response_date = first_nonempty("responseDate", "closeDate")
+    posted_date   = first_nonempty("postedDate", "publicationDate")
+    archive_date  = first_nonempty("archiveDate")
+
+    # organization/agency—SAM records vary; try multiple common paths
+    agency = first_nonempty("agency", "organization", "department")
+    organization_name = first_nonempty("organizationName", "organization", "office")
+
+    # set-aside—SAM may use setAsideCode, typeOfSetAside, or setAside
+    set_aside_code = first_nonempty("setAsideCode", "typeOfSetAside", "setAside")
+
+    # link—if provided in links[0].href, else url/samLink
+    link = "None"
     links = rec.get("links")
     if isinstance(links, list) and links:
-        first = links[0]
-        if isinstance(first, dict):
-            link = str(first.get("href") or "")
-    if not link:
-        link = g("url", "samLink", default="")
+        maybe = links[0]
+        if isinstance(maybe, dict) and maybe.get("href"):
+            link = str(maybe["href"])
+    if link == "None":
+        link = first_nonempty("url", "samLink")
 
-    # Place of performance: city/state can be dicts {code,name}
-    def _name_or_str(x):
-        if isinstance(x, dict):
-            return str(x.get("name") or x.get("code") or "")
-        return str(x or "")
+    # NAICS can appear as a simple string or nested
+    naics_code = first_nonempty("naicsCode", "naics")
 
-    pop = rec.get("placeOfPerformance") or {}
-    place_city = ""
-    place_state = ""
-    place_country_code = ""
-    if isinstance(pop, dict):
-        place_city = _name_or_str(pop.get("city"))
-        place_state = _name_or_str(pop.get("state"))
-        place_country_code = _name_or_str(pop.get("countryCode"))
+    # Title/notice type/solicitation number
+    title = first_nonempty("title")
+    notice_type = first_nonempty("noticeType", "type")
+    solicitation_number = first_nonempty("solicitationNumber", "solicitationNo")
+
+    notice_id = first_nonempty("noticeId", "id")
+
+    # Description:
+    # 1) Prefer a description/synopsis field if present
+    # 2) Otherwise fetch via noticedesc endpoint
+    description = first_nonempty("description", "synopsis", default="")
+    if (description == "" or description.lower().startswith("http")) and fetch_desc and api_keys and notice_id != "None":
+        fetched = fetch_notice_description(notice_id, api_keys)
+        description = fetched or "None"
+    elif description == "":
+        description = "None"
 
     return {
-        "pulled_at":            g("pulledAt"),
-        "notice_id":            g("noticeId", "id"),
-        "solicitation_number":  g("solicitationNumber"),
-        "title":                g("title"),
-        "notice_type":          g("noticeType", "type"),
-        "posted_date":          g("postedDate"),
-        "response_date":        g("responseDate", "closeDate"),
-        "archive_date":         g("archiveDate"),
-        "agency":               g("agency"),
-        "organization_name":    g("organizationName"),
-        "naics_code":           g("naicsCode", "naics"),
-        "set_aside_code":       g("setAsideCode", "setAside"),
-        "description":          g("description", "synopsis"),
+        "notice_id":            notice_id,
+        "solicitation_number":  solicitation_number,
+        "title":                title,
+        "notice_type":          notice_type,
+        "posted_date":          posted_date,
+        "response_date":        response_date,
+        "archive_date":         archive_date,
+        "agency":               agency,
+        "organization_name":    organization_name,
+        "naics_code":           naics_code,
+        "set_aside_code":       set_aside_code,
+        "description":          description,
         "link":                 link,
     }
+
+def _rotate_keys(keys):
+    for k in keys:
+        yield k
+
+def fetch_notice_description(notice_id: str, api_keys: list[str], timeout=20) -> str:
+    """
+    Fetch the actual solicitation description from the SAM 'noticedesc' endpoint.
+    Returns plain text. Falls back to '' if unavailable.
+    """
+    if not notice_id or not api_keys:
+        return ""
+
+    round_keys = _rotate_keys(api_keys)
+    last_exc = None
+    for _ in range(len(api_keys)):
+        key = next(round_keys)
+        try:
+            resp = requests.get(
+                SAM_DESC_URL,
+                params={"noticeid": notice_id, "api_key": key},
+                timeout=timeout,
+            )
+            if resp.status_code == 429:
+                time.sleep(1.0)
+                continue
+            resp.raise_for_status()
+
+            # SAM noticedesc often returns raw HTML or plain text; normalize to text
+            text = resp.text or ""
+            # Unescape HTML entities
+            text = html.unescape(text)
+            # Strip basic HTML tags (lightweight)
+            text = re.sub(r"<[^>]+>", " ", text)
+            # Normalize whitespace
+            text = re.sub(r"\s+", " ", text).strip()
+            return text
+        except Exception as e:
+            last_exc = e
+            time.sleep(0.5)
+            continue
+    # If all keys failed:
+    return ""

@@ -262,7 +262,7 @@ def insert_new_records_only(records) -> int:
 
     rows = []
     for r in records:
-        m = gs.map_record_allowed_fields(r)  # your mapper
+        m = gs.map_record_allowed_fields(r, api_keys=SAM_KEYS, fetch_desc=True)        
         nid = (m.get("notice_id") or "").strip()
         if not nid:
             continue
@@ -387,14 +387,12 @@ tab1, tab2, tab3 = st.tabs(["1) Fetch Solicitations", "2) Supplier Suggestions",
 with tab1:
     st.header("Filter DB (no SAM calls)")
 
-    colA, colB, colC, colD = st.columns([1,1,1,1])
+    colA, colB, colC = st.columns([1,1,1])
     with colA:
-        days_back = st.number_input("Days back (for future fetch use)", min_value=0, max_value=120, value=0, help="Not used in DB filter.")
-    with colB:
         limit_results = st.number_input("Max results to show", min_value=1, max_value=5000, value=200)
-    with colC:
+    with colB:
         keywords_raw = st.text_input("Filter keywords (OR, comma-separated)", value="rfq, rfp, rfi")
-    with colD:
+    with colC:
         naics_raw = st.text_input("Filter by NAICS (comma-separated)", value="")
 
     with st.expander("More filters (optional)"):
