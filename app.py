@@ -566,11 +566,17 @@ with tab1:
                 "Notice types",
                 ["Solicitation","Combined Synopsis/Solicitation","Sources Sought","Special Notice","SRCSGT","RFI"]
             )
-
+    filters = {
+        "keywords_or": parse_keywords_or(keywords_raw),
+        "naics": normalize_naics_input(naics_raw),
+        "set_asides": set_asides,
+        "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
+        "notice_types": notice_types,
+    }
     st.subheader("Company profile (optional)")
     company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
-
+    
     if st.button("Show top results", type="primary", key="btn_show_results"):
         try:
             # 1) Apply manual filters from DB (no SAM calls)
