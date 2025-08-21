@@ -387,7 +387,7 @@ with tab1:
     with st.expander("More filters (optional)"):
         col1, col2, col3 = st.columns([1,1,1])
         with col1:
-            set_asides = st.multiselect("Set-aside code", ["SB","WOSB","EDWOSB","HUBZone","SDVOSB","8A","SDB"])
+            set_asides = st.multiselect("Set-aside code", ["SBA","WOSB","EDWOSB","HUBZone","SDVOSB","8A","SDB"])
         with col2:
             due_before = st.date_input("Due before (optional)", value=None, format="YYYY-MM-DD")
         with col3:
