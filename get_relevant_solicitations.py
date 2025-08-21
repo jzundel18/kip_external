@@ -7,8 +7,9 @@ from typing import List, Dict, Any, Optional
 import requests, time, html, re
 
 # Production v2 endpoint (per current docs)
-SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
+SAM_BASE_URL = "https://api.sam.gov/prod/opportunities/v2/search"
 SAM_DESC_URL_V1 = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
+SAM_SEARCH_URL_V2 = "https://api.sam.gov/prod/opportunities/v2/search"
 
 # ---- Custom errors for friendly UI messages ----
 class SamQuotaError(Exception):
@@ -146,7 +147,8 @@ def get_sam_raw_v3(
 
         due_before = filters.get("due_before")
         if due_before:
-            resp = (rec.get("responseDate") or rec.get("closeDate") or "")[:10]
+            # SAM uses dueDate for response/due
+            resp = (rec.get("dueDate") or rec.get("closeDate") or rec.get("responseDueDate") or "")[:10]
             if resp and resp > str(due_before):
                 return False
 
@@ -159,15 +161,7 @@ def get_raw_sam_solicitations(limit: int, api_keys: List[str]) -> List[Dict[str,
     """Back-compat alias: today's raw records with limit=N (no extra filters)."""
     return get_sam_raw_v3(days_back=0, limit=limit, api_keys=api_keys, filters={})
 
-def _rotate_keys(keys: List[str]):
-    while True:
-        for k in keys:
-            yield k
 
-
-
-SAM_SEARCH_URL_V2 = "https://api.sam.gov/prod/opportunities/v2/search"
-SAM_DESC_URL_V1   = "https://api.sam.gov/prod/opportunities/v1/noticedesc"
 
 def _rotate_keys(keys: List[str]):
     while True:
@@ -246,8 +240,7 @@ def _pick_response_date(rec: Dict[str, Any], detail: Dict[str, Any]) -> str:
     We check both the main record and the fetched detail.
     """
     candidates = [
-        "responseDate", "responseDueDate", "closeDate", "dueDate", "responseDateTime",
-        # sometimes nested under 'dates' or similar
+    "dueDate", "responseDueDate", "closeDate", "responseDate", "responseDateTime",
     ]
     for src in (rec, detail):
         for k in candidates:
@@ -318,7 +311,17 @@ def map_record_allowed_fields(
 
     if _looks_like_placeholder_or_url(description):
         if fetch_desc and api_keys and notice_id != "None":
-            description = fetch_notice_description(notice_id, api_keys)
+            # try v2 detail first (it may include full text), else noticedesc
+            detail_text = ""
+            detail = fetch_notice_detail_v2(notice_id, api_keys)
+            for k in ("description","synopsis","longDescription","fullDescription","additionalInfo"):
+                val = detail.get(k)
+                if val and str(val).strip():
+                    detail_text = re.sub(r"\s+", " ", str(val)).strip()
+                    break
+            if not detail_text:
+                detail_text = fetch_notice_description(notice_id, api_keys)
+            description = detail_text if detail_text else "None"
         else:
             description = "None"
 
