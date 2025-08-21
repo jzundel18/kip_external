@@ -566,7 +566,6 @@ with tab1:
     st.subheader("Company profile (optional)")
     company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
-    ai_threshold = st.slider("AI match threshold", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Higher = stricter")
 
     # One-button flow
     if st.button("Show top results", type="primary", key="btn_show_results"):
@@ -586,7 +585,7 @@ with tab1:
             else:
                 # 2) Optional AI downselect by embeddings
                 if use_ai_downselect and company_desc.strip():
-                    df = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY, threshold=ai_threshold)
+                    df = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY)
 
                 # 3) Generate super-short blurbs (batched); fallback to title if not available
                 blurbs = ai_make_blurbs(df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=160, chunk_size=40)
