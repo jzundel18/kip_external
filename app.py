@@ -504,10 +504,18 @@ with tab1:
 
             if df.empty:
                 st.warning("No solicitations match your filters. Try adjusting filters or refresh today's feed.")
-                st.session_state.sol_df = None
             else:
-                # Save the filtered set (so Tab 2 can use it, etc.)
+                # --- NEW: ask AI for tiny blurbs to show instead of raw titles
+                blurbs = ai_make_blurbs(df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=200)
+                if blurbs:
+                    df = df.copy()
+                    df["blurb"] = df["notice_id"].astype(str).map(blurbs).fillna(df["title"].fillna(""))
+                    # Put blurb up front for visibility in the table
+                    front = ["blurb"]
+                    rest = [c for c in df.columns if c not in front]
+                    df = df[front + rest]
                 st.session_state.sol_df = df
+                st.success(f"Found {len(df)} solicitations.")
 
                 # 2) If AI downselect is checked & description present, rank & show top 5 (title-first, expandable details)
                 if use_ai_downselect and company_desc.strip():
@@ -550,7 +558,8 @@ with tab1:
                             # accumulate for download
                             top_rows.append(row)
 
-                            with st.expander(f"{i}. {row.get('title', 'Untitled')} — Score {score}/100"):
+                            hdr = (row.get("blurb") or row.get("title") or "Untitled")
+                            with st.expander(f"{i}. {hdr}  —  Score {score}/100"):
                                 st.write(f"**Notice ID:** {nid}")
                                 st.write(f"**Notice Type:** {row.get('notice_type','')}")
                                 st.write(f"**Posted:** {row.get('posted_date','')}")
@@ -673,3 +682,62 @@ with tab3:
 
 st.markdown("---")
 st.caption("DB schema is fixed to only the required SAM fields. Refresh inserts brand-new notices only (no updates).")
+
+def ai_make_blurbs(
+    df: pd.DataFrame,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+    max_items: int = 200,
+) -> dict[str, str]:
+    """
+    Returns {notice_id: blurb}. Each blurb is a super short, plain-English summary
+    of what the solicitation is for (title + description distilled).
+    """
+    if df is None or df.empty:
+        return {}
+
+    # Build compact payload (cap items to keep prompt small)
+    cols = ["notice_id", "title", "description"]
+    use = df[[c for c in cols if c in df.columns]].head(max_items).copy()
+    items = []
+    for _, r in use.iterrows():
+        items.append({
+            "notice_id": str(r.get("notice_id", "")),
+            "title": (r.get("title") or "")[:300],
+            "description": (r.get("description") or "")[:2000],
+        })
+
+    system_msg = (
+        "You are helping a contracts analyst. For each item, write a single, "
+        "very short blurb (max ~12 words) summarizing what the solicitation buys/needs. "
+        "Plain English, no fluff, no NAICS/set-aside boilerplate, no agency names, "
+        "no punctuation at the end if not needed."
+    )
+    user_msg = {
+        "items": items,
+        "format": 'Return JSON: {"blurbs":[{"notice_id":"...","blurb":"..."}]} with the same order.'
+    }
+
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(user_msg)},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        out = {}
+        for row in data.get("blurbs", []):
+            nid = str(row.get("notice_id", "")).strip()
+            blurb = (row.get("blurb") or "").strip()
+            if nid and blurb:
+                out[nid] = blurb
+        return out
+    except Exception as e:
+        st.warning(f"Could not generate blurbs right now ({e}). Showing titles instead.")
+        return {}
