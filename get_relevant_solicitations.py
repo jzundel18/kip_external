@@ -131,17 +131,12 @@ def _request_sam(params: Dict[str, Any], api_keys: List[str]) -> Dict[str, Any]:
     raise SamAuthError("SAM.gov request failed.")
 
 
-# --- Public fetchers ---
 def get_sam_raw_v3(
     days_back: int,
     limit: int,
     api_keys: List[str],
     filters: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch raw SAM.gov opportunity records for a date window.
-    Only date + limit are sent to the server; other filters can be applied client-side if you want.
-    """
     filters = filters or {}
     posted_from, posted_to = _window_days_back(days_back)
 
@@ -156,12 +151,19 @@ def get_sam_raw_v3(
     if not raw_records:
         return []
 
-    # Optional client-side filtering (kept simple)
+    # ---------- filter helper ----------
     def _match(rec: Dict[str, Any]) -> bool:
+        # --- Drop Award Notices (case-insensitive) ------------------  # NEW
+        nt = str(rec.get("noticeType") or rec.get("type") or "").strip().lower()  # NEW
+        if "award" in nt:                                              # NEW
+            return False                                               # NEW
+        # -------------------------------------------------------------
+
+        # (existing filters you already had)
         nts = filters.get("notice_types") or []
         if nts:
-            r_type = str(rec.get("noticeType") or rec.get("type") or "").lower()
-            if not r_type or not any(nt.lower() in r_type for nt in nts):
+            r_type = nt  # we already normalized it above
+            if not r_type or not any(t.lower() in r_type for t in nts):
                 return False
 
         kws = [k.strip().lower() for k in (filters.get("keywords_or") or []) if k.strip()]
