@@ -617,7 +617,6 @@ with tab1:
 
                             hdr = (row.get("blurb") or row.get("title") or "Untitled")
                             with st.expander(f"{i}. {hdr}  —  Score {score}/100"):
-                                st.write(f"**Notice ID:** {nid}")
                                 st.write(f"**Notice Type:** {row.get('notice_type','')}")
                                 st.write(f"**Posted:** {row.get('posted_date','')}")
                                 st.write(f"**Response Due:** {row.get('response_date','')}")
@@ -626,10 +625,6 @@ with tab1:
                                 link = row.get("link","")
                                 if link:
                                     st.write(f"**Link:** {link}")
-                                desc = row.get("description","")
-                                if desc and desc != "None":
-                                    st.markdown("**Description**")
-                                    st.write(desc)
                                 if reason:
                                     st.markdown("**Why this matched (AI):**")
                                     st.info(reason)
@@ -690,7 +685,12 @@ with tab2:
 
     if st.session_state.sup_df is not None:
         st.subheader("Supplier suggestions")
-        st.dataframe(st.session_state.sup_df, use_container_width=True)
+        to_show = st.session_state.sol_df.copy()
+        for col in ["notice_id", "description"]:
+            if col in to_show.columns:
+                to_show = to_show.drop(columns=[col])
+
+        st.dataframe(to_show, use_container_width=True)
         st.download_button(
             "Download as CSV",
             st.session_state.sup_df.to_csv(index=False).encode("utf-8"),
