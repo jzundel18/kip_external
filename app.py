@@ -13,7 +13,64 @@ from sqlmodel import SQLModel, Field, Session, create_engine, select
 
 import numpy as np
 from openai import OpenAI
+def ai_make_blurbs(
+    df: pd.DataFrame,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+    max_items: int = 200,
+) -> dict[str, str]:
+    """
+    Returns {notice_id: blurb}. Each blurb is a super short, plain-English summary
+    of what the solicitation is for (title + description distilled).
+    """
+    if df is None or df.empty:
+        return {}
 
+    # Build compact payload (cap items to keep prompt small)
+    cols = ["notice_id", "title", "description"]
+    use = df[[c for c in cols if c in df.columns]].head(max_items).copy()
+    items = []
+    for _, r in use.iterrows():
+        items.append({
+            "notice_id": str(r.get("notice_id", "")),
+            "title": (r.get("title") or "")[:300],
+            "description": (r.get("description") or "")[:2000],
+        })
+
+    system_msg = (
+        "You are helping a contracts analyst. For each item, write a single, "
+        "very short blurb (max ~12 words) summarizing what the solicitation buys/needs. "
+        "Plain English, no fluff, no NAICS/set-aside boilerplate, no agency names, "
+        "no punctuation at the end if not needed."
+    )
+    user_msg = {
+        "items": items,
+        "format": 'Return JSON: {"blurbs":[{"notice_id":"...","blurb":"..."}]} with the same order.'
+    }
+
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(user_msg)},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        out = {}
+        for row in data.get("blurbs", []):
+            nid = str(row.get("notice_id", "")).strip()
+            blurb = (row.get("blurb") or "").strip()
+            if nid and blurb:
+                out[nid] = blurb
+        return out
+    except Exception as e:
+        st.warning(f"Could not generate blurbs right now ({e}). Showing titles instead.")
+        return {}
 def ai_downselect_df(company_desc: str, df: pd.DataFrame, api_key: str,
                      threshold: float = 0.20, top_k: int | None = None) -> pd.DataFrame:
     """
@@ -683,61 +740,3 @@ with tab3:
 st.markdown("---")
 st.caption("DB schema is fixed to only the required SAM fields. Refresh inserts brand-new notices only (no updates).")
 
-def ai_make_blurbs(
-    df: pd.DataFrame,
-    api_key: str,
-    model: str = "gpt-4o-mini",
-    max_items: int = 200,
-) -> dict[str, str]:
-    """
-    Returns {notice_id: blurb}. Each blurb is a super short, plain-English summary
-    of what the solicitation is for (title + description distilled).
-    """
-    if df is None or df.empty:
-        return {}
-
-    # Build compact payload (cap items to keep prompt small)
-    cols = ["notice_id", "title", "description"]
-    use = df[[c for c in cols if c in df.columns]].head(max_items).copy()
-    items = []
-    for _, r in use.iterrows():
-        items.append({
-            "notice_id": str(r.get("notice_id", "")),
-            "title": (r.get("title") or "")[:300],
-            "description": (r.get("description") or "")[:2000],
-        })
-
-    system_msg = (
-        "You are helping a contracts analyst. For each item, write a single, "
-        "very short blurb (max ~12 words) summarizing what the solicitation buys/needs. "
-        "Plain English, no fluff, no NAICS/set-aside boilerplate, no agency names, "
-        "no punctuation at the end if not needed."
-    )
-    user_msg = {
-        "items": items,
-        "format": 'Return JSON: {"blurbs":[{"notice_id":"...","blurb":"..."}]} with the same order.'
-    }
-
-    client = OpenAI(api_key=api_key)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_msg)},
-            ],
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
-        out = {}
-        for row in data.get("blurbs", []):
-            nid = str(row.get("notice_id", "")).strip()
-            blurb = (row.get("blurb") or "").strip()
-            if nid and blurb:
-                out[nid] = blurb
-        return out
-    except Exception as e:
-        st.warning(f"Could not generate blurbs right now ({e}). Showing titles instead.")
-        return {}
