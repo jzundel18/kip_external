@@ -239,7 +239,7 @@ with st.sidebar:
     st.markdown("### Feed Settings")
     max_results_refresh = st.number_input(
         "Max results when refreshing feed",
-        min_value=50, max_value=2000, value=500, step=50,
+        min_value=1, max_value=2000, value=500, step=50,
         help="How many solicitations to pull from SAM.gov when you click Refresh."
     )
     st.markdown("---")
