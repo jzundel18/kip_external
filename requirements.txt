@@ -1,7 +1,7 @@
 streamlit
 pandas
 requests
-openai>=1.0.0
+openai>=1.40.0
 python-dotenv
 python-dateutil
 beautifulsoup4

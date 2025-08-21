@@ -98,7 +98,9 @@ def get_secret(name, default=None):
         return st.secrets[name]
     return os.getenv(name, default)
 
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    st.error("Missing OPENAI_API_KEY in Streamlit secrets.")
 SERP_API_KEY   = get_secret("SERP_API_KEY")
 SAM_KEYS       = get_secret("SAM_KEYS", [])
 
@@ -367,6 +369,9 @@ if "sol_df" not in st.session_state:
 if "sup_df" not in st.session_state:
     st.session_state.sup_df = None
 
+import json
+from openai import OpenAI
+
 def ai_rank_solicitations_by_fit(
     df: pd.DataFrame,
     company_desc: str,
@@ -376,28 +381,23 @@ def ai_rank_solicitations_by_fit(
     model: str = "gpt-4o-mini",
 ) -> list[dict]:
     """
-    Returns a list of dicts like:
-    [{"notice_id": "...", "score": 0-100, "reason": "..."}, ...] ordered best→worst
-    Only includes items that exist in df.
+    Returns: [{"notice_id": "...", "score": 0-100, "reason": "..."}] ordered best→worst.
     """
     if df is None or df.empty:
         return []
 
-    # Keep only the columns we need, and cap the candidate count to control token cost
     cols_we_care = [
         "notice_id", "title", "description", "naics_code",
         "set_aside_code", "response_date", "posted_date", "link"
     ]
-    df2 = df[[c for c in cols_we_care if c in df.columns]].copy()
-    df2 = df2.head(max_candidates)
+    df2 = df[[c for c in cols_we_care if c in df.columns]].copy().head(max_candidates)
 
-    # Build a compact JSON payload for the LLM
     items = []
     for _, r in df2.iterrows():
         items.append({
             "notice_id": str(r.get("notice_id", "")),
             "title": str(r.get("title", ""))[:300],
-            "description": str(r.get("description", ""))[:3000],  # trim to control token size
+            "description": str(r.get("description", ""))[:3000],
             "naics_code": str(r.get("naics_code", "")),
             "set_aside_code": str(r.get("set_aside_code", "")),
             "response_date": str(r.get("response_date", "")),
@@ -406,7 +406,7 @@ def ai_rank_solicitations_by_fit(
         })
 
     system_msg = (
-        "You are a contracts analyst. Rank solicitations by how well they match the company description.\n"
+        "You are a contracts analyst. Rank solicitations by how well they match the company description. "
         "Consider title, description, NAICS, set-aside, and due date recency. Prefer clear technical/mission fit."
     )
     user_msg = {
@@ -414,68 +414,49 @@ def ai_rank_solicitations_by_fit(
         "solicitations": items,
         "instructions": (
             f"Return the top {top_k} as JSON: "
-            '{"ranked":[{"notice_id":"...","score":0-100,"reason":"..."}]} . '
-            "Score should reflect strength of fit (higher is better). Keep reasons short, specific, and useful."
+            '{"ranked":[{"notice_id":"...","score":0-100,"reason":"..."}]}. '
+            "Score reflects strength of fit (higher is better). Keep reasons short and specific."
         ),
     }
 
-    # Call OpenAI — handle both new and legacy SDKs
-    content = None
-    try:
-        # New SDK
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_msg)},
-            ],
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content
-    except Exception:
-        # Legacy fallback (if your environment still uses openai.ChatCompletion)
-        import openai
-        openai.api_key = api_key
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_msg)},
-            ],
-            temperature=0.2,
-        )
-        content = resp["choices"][0]["message"]["content"]
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": json.dumps(user_msg)},
+        ],
+        temperature=0.2,
+    )
+    content = resp.choices[0].message.content
 
+    # Parse JSON safely
     try:
         data = json.loads(content or "{}")
         ranked = data.get("ranked", [])
-        # Keep only those present in df and normalize
-        keep_ids = set(df2["notice_id"].astype(str).tolist())
-        cleaned = []
-        for item in ranked:
-            nid = str(item.get("notice_id", ""))
-            if nid in keep_ids:
-                cleaned.append({
-                    "notice_id": nid,
-                    "score": float(item.get("score", 0)),
-                    "reason": str(item.get("reason", "")),
-                })
-        # De-dup + sort by score desc, truncate to top_k
-        dedup_seen = set()
-        dedup = []
-        for x in cleaned:
-            if x["notice_id"] not in dedup_seen:
-                dedup_seen.add(x["notice_id"])
-                dedup.append(x)
-        dedup.sort(key=lambda x: x["score"], reverse=True)
-        return dedup[:top_k]
     except Exception:
-        # If JSON parsing fails, return empty to avoid crashing the app
         return []
 
+    # Keep only rows that exist in df2; sort and dedupe
+    keep_ids = set(df2["notice_id"].astype(str).tolist())
+    cleaned = []
+    for item in ranked:
+        nid = str(item.get("notice_id", ""))
+        if nid in keep_ids:
+            cleaned.append({
+                "notice_id": nid,
+                "score": float(item.get("score", 0)),
+                "reason": str(item.get("reason", "")),
+            })
+
+    seen, out = set(), []
+    for x in cleaned:
+        if x["notice_id"] not in seen:
+            seen.add(x["notice_id"])
+            out.append(x)
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out[:top_k]
 
 # =========================
 # Tabs
