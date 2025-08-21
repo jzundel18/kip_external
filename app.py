@@ -250,10 +250,11 @@ with st.sidebar:
 # =========================
 # Upsert-only-new helpers
 # =========================
+# exactly what you store now
 COLS_TO_SAVE = [
     "notice_id","solicitation_number","title","notice_type",
     "posted_date","response_date","archive_date",
-    "agency","organization_name","naics_code","set_aside_code",
+    "naics_code","set_aside_code",
     "description","link"
 ]
 def insert_new_records_only(records) -> int:
@@ -287,8 +288,7 @@ def insert_new_records_only(records) -> int:
 DISPLAY_COLS = [
     "pulled_at","notice_id","solicitation_number","title","notice_type",
     "posted_date","response_date","archive_date",
-    "agency","organization_name","naics_code","set_aside_code",
-    "description","link"
+    "naics_code","set_aside_code","description","link"
 ]
 
 def query_filtered_df(filters: dict) -> pd.DataFrame:
