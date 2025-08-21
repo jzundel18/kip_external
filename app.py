@@ -367,6 +367,116 @@ if "sol_df" not in st.session_state:
 if "sup_df" not in st.session_state:
     st.session_state.sup_df = None
 
+def ai_rank_solicitations_by_fit(
+    df: pd.DataFrame,
+    company_desc: str,
+    api_key: str,
+    top_k: int = 5,
+    max_candidates: int = 100,
+    model: str = "gpt-4o-mini",
+) -> list[dict]:
+    """
+    Returns a list of dicts like:
+    [{"notice_id": "...", "score": 0-100, "reason": "..."}, ...] ordered best→worst
+    Only includes items that exist in df.
+    """
+    if df is None or df.empty:
+        return []
+
+    # Keep only the columns we need, and cap the candidate count to control token cost
+    cols_we_care = [
+        "notice_id", "title", "description", "naics_code",
+        "set_aside_code", "response_date", "posted_date", "link"
+    ]
+    df2 = df[[c for c in cols_we_care if c in df.columns]].copy()
+    df2 = df2.head(max_candidates)
+
+    # Build a compact JSON payload for the LLM
+    items = []
+    for _, r in df2.iterrows():
+        items.append({
+            "notice_id": str(r.get("notice_id", "")),
+            "title": str(r.get("title", ""))[:300],
+            "description": str(r.get("description", ""))[:3000],  # trim to control token size
+            "naics_code": str(r.get("naics_code", "")),
+            "set_aside_code": str(r.get("set_aside_code", "")),
+            "response_date": str(r.get("response_date", "")),
+            "posted_date": str(r.get("posted_date", "")),
+            "link": str(r.get("link", "")),
+        })
+
+    system_msg = (
+        "You are a contracts analyst. Rank solicitations by how well they match the company description.\n"
+        "Consider title, description, NAICS, set-aside, and due date recency. Prefer clear technical/mission fit."
+    )
+    user_msg = {
+        "company_description": company_desc,
+        "solicitations": items,
+        "instructions": (
+            f"Return the top {top_k} as JSON: "
+            '{"ranked":[{"notice_id":"...","score":0-100,"reason":"..."}]} . '
+            "Score should reflect strength of fit (higher is better). Keep reasons short, specific, and useful."
+        ),
+    }
+
+    # Call OpenAI — handle both new and legacy SDKs
+    content = None
+    try:
+        # New SDK
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(user_msg)},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content
+    except Exception:
+        # Legacy fallback (if your environment still uses openai.ChatCompletion)
+        import openai
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(user_msg)},
+            ],
+            temperature=0.2,
+        )
+        content = resp["choices"][0]["message"]["content"]
+
+    try:
+        data = json.loads(content or "{}")
+        ranked = data.get("ranked", [])
+        # Keep only those present in df and normalize
+        keep_ids = set(df2["notice_id"].astype(str).tolist())
+        cleaned = []
+        for item in ranked:
+            nid = str(item.get("notice_id", ""))
+            if nid in keep_ids:
+                cleaned.append({
+                    "notice_id": nid,
+                    "score": float(item.get("score", 0)),
+                    "reason": str(item.get("reason", "")),
+                })
+        # De-dup + sort by score desc, truncate to top_k
+        dedup_seen = set()
+        dedup = []
+        for x in cleaned:
+            if x["notice_id"] not in dedup_seen:
+                dedup_seen.add(x["notice_id"])
+                dedup.append(x)
+        dedup.sort(key=lambda x: x["score"], reverse=True)
+        return dedup[:top_k]
+    except Exception:
+        # If JSON parsing fails, return empty to avoid crashing the app
+        return []
+
+
 # =========================
 # Tabs
 # =========================
@@ -431,6 +541,64 @@ with tab1:
             file_name="sol_list.csv",
             mime="text/csv"
         )
+    # Only show AI ranking controls when we have a table to rank
+    if st.session_state.sol_df is not None:
+        st.markdown("### AI: Rank Top 5 by Company Fit")
+        st.caption("Uses your company description to rank the most relevant opportunities. Shows titles first; click to expand details.")
+
+        # Reuse the company_desc field you already capture above; if not present, add a small input here:
+        if not company_desc.strip():
+            company_desc_local = st.text_area("Brief Company Description (if you didn’t fill it above)", value="", height=120, key="company_desc_local")
+        else:
+            company_desc_local = company_desc
+
+        col_r1, col_r2 = st.columns([1, 4])
+        with col_r1:
+            if st.button("Rank top 5 by fit (AI)", type="primary", key="btn_rank_ai"):
+                if not company_desc_local.strip():
+                    st.error("Please enter a company description to rank against.")
+                else:
+                    with st.spinner("Scoring and ranking…"):
+                        ranked = ai_rank_solicitations_by_fit(
+                            st.session_state.sol_df,
+                            company_desc_local,
+                            OPENAI_API_KEY,
+                            top_k=5,
+                            max_candidates=100,
+                        )
+                    if not ranked:
+                        st.warning("No ranking returned (possibly not enough description text or model parsing issue).")
+                    else:
+                        # Build a quick lookup for details by notice_id
+                        df = st.session_state.sol_df
+                        idx_by_id = {str(x): i for i, x in enumerate(df["notice_id"].astype(str).tolist())}
+
+                        st.success(f"Top {len(ranked)} matches:")
+                        for i, item in enumerate(ranked, start=1):
+                            nid = item["notice_id"]
+                            score = int(round(item["score"]))
+                            reason = item.get("reason", "")
+                            row = df.iloc[idx_by_id[nid]]
+
+                            # Title first; click to expand details
+                            with st.expander(f"{i}. {row.get('title', 'Untitled')}  —  Score {score}/100"):
+                                # Show a compact details block
+                                st.write(f"**Notice ID:** {nid}")
+                                st.write(f"**Notice Type:** {row.get('notice_type','')}")
+                                st.write(f"**Posted:** {row.get('posted_date','')}")
+                                st.write(f"**Response Due:** {row.get('response_date','')}")
+                                st.write(f"**NAICS:** {row.get('naics_code','')}")
+                                st.write(f"**Set-aside:** {row.get('set_aside_code','')}")
+                                link = row.get("link","")
+                                if link:
+                                    st.write(f"**Link:** {link}")
+                                desc = row.get("description","")
+                                if desc and desc != "None":
+                                    st.markdown("**Description**")
+                                    st.write(desc)
+                                if reason:
+                                    st.markdown("**Why this matched (AI):**")
+                                    st.info(reason)
 
 # ---- Tab 2
 with tab2:
