@@ -369,7 +369,19 @@ def map_record_allowed_fields(
     posted_date          = _first_nonempty(rec, "postedDate", "publicationDate")
     archive_date         = _first_nonempty(rec, "archiveDate")
     naics_code           = _first_nonempty(rec, "naicsCode", "naics")
-    set_aside_code       = _first_nonempty(rec, "setAsideCode", "typeOfSetAside", "setAside")
+    raw_set_aside        = _first_nonempty(rec, "setAsideCode", "typeOfSetAside", "setAside")
+
+    # normalize common SBA codes
+    if raw_set_aside:
+        code = raw_set_aside.strip().upper()
+        if code in {"SB", "SBSA", "SMALL BUSINESS"}:
+            set_aside_code = "SBA"
+        elif code in {"8A", "8(A)", "SBA 8A"}:
+            set_aside_code = "SBA-8A"
+        else:
+            set_aside_code = code
+    else:
+        set_aside_code = "None"
 
     # link (handy reference)
     link = "None"

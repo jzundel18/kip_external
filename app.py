@@ -374,7 +374,7 @@ tab1, tab2, tab3 = st.tabs(["1) Fetch Solicitations", "2) Supplier Suggestions",
 
 # ---- Tab 1
 with tab1:
-    st.header("Filter DB (no SAM calls)")
+    st.header("Filter Solicitations")
 
     colA, colB, colC = st.columns([1,1,1])
     with colA:
@@ -407,7 +407,7 @@ with tab1:
     company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
     ai_threshold = st.slider("AI match threshold", min_value=0.0, max_value=1.0, value=0.20, step=0.01, help="Higher = stricter")
-    if st.button("Fetch from local DB", type="primary"):
+    if st.button("Show Results", type="primary"):
         try:
             df = query_filtered_df(filters)
             if use_ai_downselect and company_desc.strip():
