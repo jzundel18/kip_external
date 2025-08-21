@@ -407,6 +407,10 @@ def query_filtered_df(filters: dict) -> pd.DataFrame:
 
     return df.reset_index(drop=True)
 
+
+def _hide_notice_and_description(df: pd.DataFrame) -> pd.DataFrame:
+    # UI should not show these two columns
+    return df.drop(columns=[c for c in ["notice_id", "description"] if c in df.columns], errors="ignore")
 # =========================
 # Header & top controls
 # =========================
@@ -567,60 +571,129 @@ with tab1:
     company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
 
-    # One-button flow
     if st.button("Show top results", type="primary", key="btn_show_results"):
         try:
-            # 1) Manual filters against the DB
-            filters = {
-                "keywords_or": parse_keywords_or(keywords_raw),
-                "naics": normalize_naics_input(naics_raw),
-                "set_asides": set_asides,
-                "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
-                "notice_types": notice_types,
-            }
+            # 1) Apply manual filters from DB (no SAM calls)
             df = query_filtered_df(filters)
 
             if df.empty:
                 st.warning("No solicitations match your filters. Try adjusting filters or refresh today's feed.")
+                st.session_state.sol_df = None
             else:
-                # 2) Optional AI downselect by embeddings
+                # ===== IF AI downselect + company description → Rank Top 5 =====
                 if use_ai_downselect and company_desc.strip():
-                    df = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY)
+                    # Pre-trim with embeddings to keep prompt small & fast
+                    # Keep the most-similar N items before LLM ranking
+                    pretrim = ai_downselect_df(company_desc.strip(), df, OPENAI_API_KEY, top_k=80)
 
-                # 3) Generate super-short blurbs (batched); fallback to title if not available
-                blurbs = ai_make_blurbs(df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=160, chunk_size=40)
-                df = df.copy()
-                df["blurb"] = df["notice_id"].astype(str).map(blurbs).fillna(df["title"].fillna(""))
+                    if pretrim.empty:
+                        st.info("AI pre-filter returned nothing. Showing manually filtered table instead.")
+                        show_df = df.head(int(limit_results)) if limit_results else df
+                        # Generate very short blurbs only for rows we will display
+                        blurbs = ai_make_blurbs(show_df, OPENAI_API_KEY, model="gpt-4o-mini",
+                                                max_items=min(150, int(limit_results or 150)))
+                        show_df = show_df.copy()
+                        show_df["blurb"] = show_df["notice_id"].astype(str).map(blurbs).fillna(show_df["title"].fillna(""))
+                        st.session_state.sol_df = show_df
+                        st.subheader(f"Solicitations ({len(show_df)})")
+                        st.dataframe(_hide_notice_and_description(show_df), use_container_width=True)
+                        st.download_button(
+                            "Download filtered as CSV",
+                            show_df.to_csv(index=False).encode("utf-8"),
+                            file_name="sol_list.csv",
+                            mime="text/csv"
+                        )
+                    else:
+                        # Rank Top 5 with LLM (small prompt, capped candidates)
+                        with st.spinner("Ranking top matches with AI…"):
+                            ranked = ai_rank_solicitations_by_fit(
+                                df=pretrim,
+                                company_desc=company_desc.strip(),
+                                api_key=OPENAI_API_KEY,
+                                top_k=5,
+                                max_candidates=60,     # keep prompt compact → faster, cheaper
+                                model="gpt-4o-mini",
+                            )
 
-                # 4) Stash final filtered DF; then show limited rows
-                st.session_state.sol_df = df
-                if limit_results and not df.empty:
-                    df_show = df.head(int(limit_results))
+                        if not ranked:
+                            st.info("AI ranking returned no results; showing the manually filtered table instead.")
+                            show_df = df.head(int(limit_results)) if limit_results else df
+                            # blurbs only for what we show
+                            blurbs = ai_make_blurbs(show_df, OPENAI_API_KEY, model="gpt-4o-mini",
+                                                    max_items=min(150, int(limit_results or 150)))
+                            show_df = show_df.copy()
+                            show_df["blurb"] = show_df["notice_id"].astype(str).map(blurbs).fillna(show_df["title"].fillna(""))
+                            st.session_state.sol_df = show_df
+                            st.subheader(f"Solicitations ({len(show_df)})")
+                            st.dataframe(_hide_notice_and_description(show_df), use_container_width=True)
+                            st.download_button(
+                                "Download filtered as CSV",
+                                show_df.to_csv(index=False).encode("utf-8"),
+                                file_name="sol_list.csv",
+                                mime="text/csv"
+                            )
+                        else:
+                            # Build ordered Top-5 dataframe
+                            id_order = [x["notice_id"] for x in ranked]
+                            preorder = {nid: i for i, nid in enumerate(id_order)}
+                            top_df = pretrim[pretrim["notice_id"].astype(str).isin(id_order)].copy()
+                            top_df["__order"] = top_df["notice_id"].astype(str).map(preorder)
+                            top_df = top_df.sort_values("__order").drop(columns="__order")
+
+                            # Generate blurbs only for Top-5
+                            blurbs = ai_make_blurbs(top_df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=10)
+                            top_df["blurb"] = top_df["notice_id"].astype(str).map(blurbs).fillna(top_df["title"].fillna(""))
+
+                            # Show Top-5 as expanders: blurb first, click to see details
+                            st.success(f"Top {len(top_df)} matches by company fit:")
+                            # quick lookup for reasons
+                            reason_by_id = {x["notice_id"]: x.get("reason", "") for x in ranked}
+
+                            for i, row in enumerate(top_df.itertuples(index=False), start=1):
+                                hdr = (getattr(row, "blurb", None) or getattr(row, "title", None) or "Untitled")
+                                with st.expander(f"{i}. {hdr}"):
+                                    st.write(f"**Notice Type:** {getattr(row, 'notice_type', '')}")
+                                    st.write(f"**Posted:** {getattr(row, 'posted_date', '')}")
+                                    st.write(f"**Response Due:** {getattr(row, 'response_date', '')}")
+                                    st.write(f"**NAICS:** {getattr(row, 'naics_code', '')}")
+                                    st.write(f"**Set-aside:** {getattr(row, 'set_aside_code', '')}")
+                                    link = getattr(row, "link", "")
+                                    if link:
+                                        st.write(f"**Link:** {link}")
+                                    reason = reason_by_id.get(str(getattr(row, "notice_id", "")), "")
+                                    if reason:
+                                        st.markdown("**Why this matched (AI):**")
+                                        st.info(reason)
+
+                            # Remember for downstream tabs / downloads
+                            st.session_state.sol_df = top_df.copy()
+
+                            # Optional: let user download just the Top-5 rows
+                            st.download_button(
+                                "Download Top-5 (AI-ranked) as CSV",
+                                top_df.to_csv(index=False).encode("utf-8"),
+                                file_name="top5_ai_ranked.csv",
+                                mime="text/csv"
+                            )
+
+                # ===== NO AI → just show the filtered table with blurbs =====
                 else:
-                    df_show = df
+                    show_df = df.head(int(limit_results)) if limit_results else df
+                    # blurbs only for what we show (kept small)
+                    blurbs = ai_make_blurbs(show_df, OPENAI_API_KEY, model="gpt-4o-mini",
+                                            max_items=min(150, int(limit_results or 150)))
+                    show_df = show_df.copy()
+                    show_df["blurb"] = show_df["notice_id"].astype(str).map(blurbs).fillna(show_df["title"].fillna(""))
 
-                # UI columns: exclude notice_id and description
-                cols_for_ui = [
-                    "blurb",
-                    "solicitation_number",
-                    "notice_type",
-                    "posted_date",
-                    "response_date",
-                    "naics_code",
-                    "set_aside_code",
-                    "link",
-                ]
-                to_show = [c for c in cols_for_ui if c in df_show.columns]
-
-                st.success(f"Found {len(df)} solicitations.")
-                st.subheader(f"Solicitations ({len(df_show)})")
-                st.dataframe(df_show[to_show], use_container_width=True)
-                st.download_button(
-                    "Download filtered as CSV",
-                    df_show[to_show].to_csv(index=False).encode("utf-8"),
-                    file_name="sol_list.csv",
-                    mime="text/csv"
-                )
+                    st.session_state.sol_df = show_df
+                    st.subheader(f"Solicitations ({len(show_df)})")
+                    st.dataframe(_hide_notice_and_description(show_df), use_container_width=True)
+                    st.download_button(
+                        "Download filtered as CSV",
+                        show_df.to_csv(index=False).encode("utf-8"),
+                        file_name="sol_list.csv",
+                        mime="text/csv"
+                    )
 
         except Exception as e:
             st.exception(e)
