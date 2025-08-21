@@ -167,10 +167,6 @@ class SolicitationRaw(SQLModel, table=True):
     posted_date: Optional[str] = Field(default=None, index=True)
     response_date: Optional[str] = Field(default=None, index=True)
     archive_date: Optional[str] = Field(default=None, index=True)
-
-    agency: Optional[str] = Field(default=None, index=True)
-    organization_name: Optional[str] = Field(default=None, index=True)
-
     naics_code: Optional[str] = Field(default=None, index=True)
 
     set_aside_code: Optional[str] = Field(default=None, index=True)
@@ -192,8 +188,6 @@ REQUIRED_COLS = {
     "posted_date": "TEXT",
     "response_date": "TEXT",
     "archive_date": "TEXT",
-    "agency": "TEXT",
-    "organization_name": "TEXT",
     "naics_code": "TEXT",
     "set_aside_code": "TEXT",
     "description": "TEXT",
@@ -316,11 +310,6 @@ def query_filtered_df(filters: dict) -> pd.DataFrame:
     if sas:
         df = df[df["set_aside_code"].fillna("").str.lower().apply(lambda s: any(sa.lower() in s for sa in sas))]
 
-    # agency contains
-    agency_contains = (filters.get("agency_contains") or "").strip().lower()
-    if agency_contains:
-        df = df[df["agency"].fillna("").str.lower().str.contains(agency_contains)]
-
     # notice types
     nts = filters.get("notice_types") or []
     if nts:
@@ -396,14 +385,12 @@ with tab1:
         naics_raw = st.text_input("Filter by NAICS (comma-separated)", value="")
 
     with st.expander("More filters (optional)"):
-        col1, col2, col3, col4 = st.columns([1,1,1,1])
+        col1, col2, col3 = st.columns([1,1,1])
         with col1:
             set_asides = st.multiselect("Set-aside code", ["SB","WOSB","EDWOSB","HUBZone","SDVOSB","8A","SDB"])
         with col2:
-            agency_contains = st.text_input("Agency contains", value="")
-        with col3:
             due_before = st.date_input("Due before (optional)", value=None, format="YYYY-MM-DD")
-        with col4:
+        with col3:
             notice_types = st.multiselect(
                 "Notice types",
                 ["Solicitation","Combined Synopsis/Solicitation","Sources Sought","Special Notice","SRCSGT","RFI"]
@@ -413,7 +400,6 @@ with tab1:
         "keywords_or": parse_keywords_or(keywords_raw),
         "naics": normalize_naics_input(naics_raw),
         "set_asides": set_asides,
-        "agency_contains": agency_contains.strip(),
         "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
         "notice_types": notice_types,
     }

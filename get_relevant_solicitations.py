@@ -144,12 +144,6 @@ def get_sam_raw_v3(
             if not rec_sa or not any(sa.lower() in rec_sa for sa in sas):
                 return False
 
-        agency_sub = (filters.get("agency_contains") or "").strip().lower()
-        if agency_sub:
-            agency = str(rec.get("department") or rec.get("agency") or rec.get("organizationName") or "").lower()
-            if agency_sub not in agency:
-                return False
-
         due_before = filters.get("due_before")
         if due_before:
             resp = (rec.get("responseDate") or rec.get("closeDate") or "")[:10]
