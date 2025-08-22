@@ -340,6 +340,8 @@ def insert_new_records_only(records) -> int:
     rows = []
     for r in records:
         m = gs.map_record_allowed_fields(r, api_keys=SAM_KEYS, fetch_desc=True)
+        if (m.get("notice_type") or "").strip().lower() == "justification":
+            continue
         nid = (m.get("notice_id") or "").strip()
         if not nid:
             continue

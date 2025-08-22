@@ -153,6 +153,9 @@ def get_sam_raw_v3(
 
     # ---------- filter helper ----------
     def _match(rec: Dict[str, Any]) -> bool:
+        r_type_raw = str(rec.get("noticeType") or rec.get("type") or "")
+        if r_type_raw.strip().lower() == "justification":
+            return False
         # --- Drop Award Notices (case-insensitive) ------------------  # NEW
         nt = str(rec.get("noticeType") or rec.get("type") or "").strip().lower()  # NEW
         if "award" in nt:                                              # NEW
