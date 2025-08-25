@@ -353,10 +353,6 @@ def get_suppliers(solicitations, our_recommended_suppliers, our_not_recommended_
 
 if __name__ == "__main__":
 
-    # === Set your API keys ===
-    OPENAI_API_KEY = "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"
-    serpapi_api_key = "1ac2dd6ee2ae698498b425c27e1a9dbe7185ca14b1a6946bd6d03037d3ad1687"
-
     #File Names
     CSV_INPUT = "sol_list"
     OUTPUT_CSV = "supplier_suggestions"

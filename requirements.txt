@@ -10,3 +10,4 @@ python-docx
 sqlmodel
 sqlalchemy
 psycopg2-binary
+pytz

@@ -247,7 +247,6 @@ if __name__ == "__main__":
     SOl_INFO_TEMPLATE = "solicitation_details_template.txt"
     OUTPUT_DIR = "proposals"
 
-    OPENAI_API_KEY = "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"
-    
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # use this instead of a literal "sk-..."    
     df = load_csv(CSV_FILE)
     validate_supplier_and_write_proposal(df, OUTPUT_DIR, OPENAI_API_KEY, BID_TEMPLATE_FILE, SOl_INFO_TEMPLATE)

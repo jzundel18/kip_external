@@ -146,6 +146,11 @@ def get_sam_raw_v3(
         "postedTo": posted_to,      # MM/dd/YYYY
     }
 
+    # NEW: if caller provides a specific notice_id, pass it through
+    if filters.get("notice_id"):
+        params["noticeid"] = str(filters["notice_id"]).strip()
+        params["limit"] = 1  # fetching a specific record
+
     data = _request_sam(params, api_keys)
     raw_records = data.get("opportunitiesData") or data.get("data") or []
     if not raw_records:
@@ -153,6 +158,12 @@ def get_sam_raw_v3(
 
     # ---------- filter helper ----------
     def _match(rec: Dict[str, Any]) -> bool:
+        # NEW: enforce notice_id match if supplied
+        if filters.get("notice_id"):
+            rid = str(rec.get("noticeId") or rec.get("id") or "").strip()
+            if rid != str(filters["notice_id"]).strip():
+                return False
+
         r_type_raw = str(rec.get("noticeType") or rec.get("type") or "")
         if r_type_raw.strip().lower() == "justification":
             return False
@@ -251,7 +262,7 @@ def fetch_notice_description(notice_id: str, api_keys: List[str]) -> str:
     Get full description text using two strategies:
       1) v2 detail (if it includes description/synopsis/long text)
       2) v1 noticedesc (HTML/plain -> normalized text)
-    Returns 'None' if both fail.
+    Returns an empty string if both fail.
     """
     # 1) try v2 detail
     detail = fetch_notice_detail_v2(notice_id, api_keys)
@@ -267,7 +278,8 @@ def fetch_notice_description(notice_id: str, api_keys: List[str]) -> str:
         try:
             r = _http_get(SAM_DESC_URL_V1, {"noticeid": notice_id}, key)
             if r.status_code == 429:
-                time.sleep(1.0); continue
+                time.sleep(1.0)
+                continue
             r.raise_for_status()
             text = r.text or ""
             text = html.unescape(text)
@@ -278,7 +290,9 @@ def fetch_notice_description(notice_id: str, api_keys: List[str]) -> str:
         except Exception:
             time.sleep(0.5)
             continue
-    return "None"
+
+    # No description found → return empty string so DB sees it as "missing"
+    return ""
 
 
 # --- deep search helpers for nested payloads ---
@@ -392,7 +406,7 @@ def map_record_allowed_fields(
     # response_date: prefer SAM's dueDate (via _pick_response_date)
     response_date = _pick_response_date(rec, detail)
 
-    # description: prefer inline; if missing/URL, use detail, then noticedesc
+        # description: prefer inline; if missing/URL, use detail, then noticedesc
     description = _first_nonempty(rec, "description", "synopsis", default="")
 
     def _looks_like_placeholder_or_url(t: str) -> bool:
@@ -411,7 +425,13 @@ def map_record_allowed_fields(
                     break
         if not detail_text and fetch_desc and api_keys and notice_id != "None":
             detail_text = fetch_notice_description(notice_id, api_keys)
-        description = detail_text if detail_text else "None"
+
+        # ⬇️ IMPORTANT: if still nothing, make it an empty string (not "None")
+        description = detail_text if detail_text else ""
+
+    # Final safety: normalize placeholders that may have slipped through
+    if description and description.strip().lower() in ("none", "n/a", "na"):
+        description = ""
 
     return {
         "notice_id":            notice_id,
