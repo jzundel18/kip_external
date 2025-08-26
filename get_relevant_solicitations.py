@@ -136,6 +136,8 @@ def get_sam_raw_v3(
     limit: int,
     api_keys: List[str],
     filters: Optional[Dict[str, Any]] = None,
+    *,
+    offset: int = 0,          # NEW
 ) -> List[Dict[str, Any]]:
     filters = filters or {}
     posted_from, posted_to = _window_days_back(days_back)
@@ -143,7 +145,9 @@ def get_sam_raw_v3(
     params = {
         "limit": int(limit),
         "postedFrom": posted_from,  # MM/dd/YYYY
-        "postedTo": posted_to,      # MM/dd/YYYY
+        "postedTo": posted_to,      # MM/dd/
+        "offset": int(offset),   # NEW: SAM v2 accepts 'offset' for paging
+
     }
 
     # NEW: if caller provides a specific notice_id, pass it through

@@ -10,7 +10,8 @@ for p in (REPO_ROOT, REPO_ROOT / "scripts", REPO_ROOT / "src"):
 
 import pandas as pd
 import sqlalchemy as sa
-from sqlalchemy import create_engine, text as sqltext
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text as sqltext
 
 import get_relevant_solicitations as gs
 from get_relevant_solicitations import SamQuotaError, SamAuthError, SamBadRequestError
@@ -18,112 +19,104 @@ from get_relevant_solicitations import SamQuotaError, SamAuthError, SamBadReques
 # ---------- Env / secrets ----------
 DB_URL = os.environ.get("SUPABASE_DB_URL", "sqlite:///app.db")
 
-# Handle SAM_KEYS as comma OR newline separated
+# SAM_KEYS: accept comma/newline separated
 _raw_keys = os.environ.get("SAM_KEYS", "")
 SAM_KEYS = []
 if _raw_keys:
     parts = []
-    for line in _raw_keys.replace("\r", "").split("\n"):
+    for line in _raw_keys.replace("\r","").split("\n"):
         parts.extend([p.strip() for p in line.split(",")])
     SAM_KEYS = [p for p in parts if p]
 print(f"SAM_KEYS configured: {len(SAM_KEYS)} key(s)")
+
+# Backfill knobs (env overrideable)
+BATCH_SIZE = int(os.environ.get("BACKFILL_BATCH", "50"))      # rows per DB batch
+MAX_UPDATES = int(os.environ.get("BACKFILL_MAX", "500"))      # safety cap per run
+DELAY_SEC = float(os.environ.get("BACKFILL_DELAY_SEC", "0.5"))# polite delay between API calls
 
 # --- DB (with timeout for Postgres) ---
 pg_opts = {}
 if DB_URL.startswith("postgresql"):
     pg_opts["connect_args"] = {"connect_timeout": 10}
-
 engine = create_engine(DB_URL, pool_pre_ping=True, **pg_opts)
 
-# ---------- Helpers ----------
-def fetch_missing(limit: int = 50) -> pd.DataFrame:
+def fetch_missing(limit: int) -> pd.DataFrame:
     """
     Return up to `limit` rows with missing/empty descriptions.
-    Use sa.text(...) so named params like :lim compile correctly for psycopg2.
-    Order by pulled_at (always present) so it works on both SQLite and Postgres.
+    NOTE: use sqltext() for named bind parameter portability.
     """
-    stmt = sa.text("""
+    sql = sqltext("""
         SELECT notice_id, title, link
         FROM solicitationraw
-        WHERE description IS NULL OR description = ''
-        ORDER BY pulled_at DESC
+        WHERE (description IS NULL OR description = '')
+        ORDER BY posted_date DESC NULLS LAST, pulled_at DESC NULLS LAST
         LIMIT :lim
     """)
     with engine.connect() as conn:
-        df = pd.read_sql_query(stmt, conn, params={"lim": int(limit)})
-    return df
+        return pd.read_sql_query(sql, conn, params={"lim": limit})
 
 def update_description(notice_id: str, desc: str):
-    stmt = sa.text("UPDATE solicitationraw SET description = :desc WHERE notice_id = :nid")
+    sql = sa.text("UPDATE solicitationraw SET description = :desc WHERE notice_id = :nid")
     with engine.begin() as conn:
-        conn.execute(stmt, {"desc": desc, "nid": notice_id})
+        conn.execute(sql, {"desc": desc, "nid": notice_id})
 
-# ---------- Main ----------
 def main():
     print("backfill_descriptions.py: starting…", flush=True)
+    total_updated = 0
+    batches = 0
 
-    # Quick DB ping so logs tell us if we’re stuck on DB
-    try:
-        with engine.connect() as conn:
-            conn.execute(sa.text("SELECT 1"))
-        print("DB ping OK")
-    except Exception as e:
-        print("DB ping FAILED:", repr(e))
-        sys.exit(2)
-
-    # Pull a small batch of missing descriptions
-    try:
-        df = fetch_missing(limit=50)
-    except Exception as e:
-        print("DB fetch failed:", repr(e))
-        sys.exit(2)
-
-    if df.empty:
-        print("No rows missing descriptions.")
-        return
-
-    print(f"Found {len(df)} solicitations missing descriptions.")
-
-    updated = 0
-    for i, row in df.iterrows():
-        nid = str(row["notice_id"])
-        title = str(row.get("title") or "")
-        link = str(row.get("link") or "")
-
+    while total_updated < MAX_UPDATES:
         try:
-            # Fetch fresh detail from SAM.gov by notice_id.
-            recs = gs.get_sam_raw_v3(
-                days_back=30,   # wide window to find the item
-                limit=1,
-                api_keys=SAM_KEYS,
-                filters={"notice_id": nid}
-            )
-            if not recs:
-                print(f"[{i}] {nid} — no record returned from SAM.gov")
-                continue
-
-            rec = recs[0]
-            mapped = gs.map_record_allowed_fields(rec, api_keys=SAM_KEYS, fetch_desc=True)
-            desc = (mapped.get("description") or "").strip()
-
-            if desc:
-                update_description(nid, desc)
-                updated += 1
-                print(f"[{i}] {nid} — description updated ({len(desc)} chars).")
-            else:
-                print(f"[{i}] {nid} — still no description.")
-        except (SamQuotaError, SamAuthError, SamBadRequestError) as e:
-            print(f"[{i}] {nid} — SAM error:", repr(e))
-            # If quota error, don’t hammer the API further
-            if isinstance(e, SamQuotaError):
-                break
+            df = fetch_missing(limit=BATCH_SIZE)
         except Exception as e:
-            print(f"[{i}] {nid} — error fetching description:", repr(e))
+            print("DB fetch failed:", repr(e))
+            sys.exit(2)
 
-        # polite delay
-        time.sleep(0.5)
+        if df.empty:
+            print(f"No rows missing descriptions. Total updated this run: {total_updated}")
+            break
 
-    print(f"Backfill complete. {updated} descriptions updated.")
+        print(f"Batch {batches+1}: found {len(df)} rows missing descriptions…")
+
+        for i, row in df.iterrows():
+            if total_updated >= MAX_UPDATES:
+                print(f"Reached MAX_UPDATES={MAX_UPDATES}; stopping.")
+                break
+
+            nid = str(row["notice_id"])
+            title = str(row.get("title") or "")
+            link = str(row.get("link") or "")
+
+            try:
+                # Try to fetch detail — prefer v2 detail, fallback to v1 noticedesc.
+                # This returns "" if no description could be fetched (not 'None').
+                desc = gs.fetch_notice_description(nid, SAM_KEYS).strip()
+
+                if desc:
+                    update_description(nid, desc)
+                    total_updated += 1
+                    print(f"  [{total_updated}] {nid} — description updated ({len(desc)} chars).")
+                else:
+                    # Leave it empty; another run may succeed later
+                    print(f"  [skip] {nid} — no description returned yet.")
+
+            except SamQuotaError:
+                print("  [quota] All SAM.gov keys rate-limited. Stopping backfill early.")
+                print(f"Backfill partial complete. {total_updated} descriptions updated.")
+                sys.exit(0)
+            except SamAuthError:
+                print("  [auth] SAM.gov auth failed for all keys. Stopping.")
+                sys.exit(2)
+            except SamBadRequestError as e:
+                print(f"  [400] Bad request for {nid}: {e}")
+            except Exception as e:
+                print(f"  [error] {nid} — {repr(e)}")
+
+            time.sleep(DELAY_SEC)
+
+        batches += 1
+
+    print(f"Backfill complete. {total_updated} descriptions updated in {batches} batch(es).")
 
 if __name__ == "__main__":
     try:

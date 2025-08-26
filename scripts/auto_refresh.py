@@ -10,11 +10,9 @@ for p in (REPO_ROOT, REPO_ROOT / "scripts", REPO_ROOT / "src"):
 
 import sqlalchemy as sa
 from sqlalchemy import create_engine, text as sqltext
-import pandas as pd
 
 import get_relevant_solicitations as gs
 from get_relevant_solicitations import SamQuotaError, SamAuthError, SamBadRequestError
-
 
 # ---------- Env / secrets ----------
 DB_URL = os.environ.get("SUPABASE_DB_URL", "sqlite:///app.db")
@@ -29,12 +27,17 @@ if _raw_keys:
     SAM_KEYS = [p for p in parts if p]
 print(f"SAM_KEYS configured: {len(SAM_KEYS)} key(s)")
 
-# Days back – default to 1 (last 24h window)
+# Time window (default last 24h)
 try:
     DAYS_BACK = int(os.environ.get("DAYS_BACK", "1"))
 except ValueError:
     DAYS_BACK = 1
 print(f"DAYS_BACK = {DAYS_BACK}")
+
+# Paging controls (tune via GitHub Actions env if desired)
+PAGE_SIZE = int(os.environ.get("SAM_PAGE_SIZE", "200"))      # how many per page
+MAX_RECORDS = int(os.environ.get("SAM_MAX_RECORDS", "5000")) # safety cap per run
+print(f"Paging: PAGE_SIZE={PAGE_SIZE}, MAX_RECORDS={MAX_RECORDS}")
 
 # --- DB (add connect timeout for Postgres) ---
 pg_opts = {}
@@ -42,7 +45,6 @@ if DB_URL.startswith("postgresql"):
     pg_opts["connect_args"] = {"connect_timeout": 10}  # seconds
 
 engine = create_engine(DB_URL, pool_pre_ping=True, **pg_opts)
-
 print("auto_refresh.py: engine created", flush=True)
 
 # Quick DB ping so we can see if we hang here
@@ -53,7 +55,6 @@ try:
 except Exception as e:
     print("auto_refresh.py: DB ping FAILED:", repr(e), flush=True)
     sys.exit(2)
-
 
 # ---------- Insert helper ----------
 COLS_TO_SAVE = [
@@ -69,6 +70,7 @@ def insert_new_records_only(records) -> int:
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows = []
     for r in records:
+        # Fast path: don't fetch description here; backfill runs separately
         m = gs.map_record_allowed_fields(r, api_keys=SAM_KEYS, fetch_desc=False)
         if (m.get("notice_type") or "").strip().lower() == "justification":
             continue
@@ -94,7 +96,6 @@ def insert_new_records_only(records) -> int:
         conn.execute(sql, rows)
     return len(rows)
 
-
 def db_counts():
     try:
         with engine.connect() as conn:
@@ -105,7 +106,6 @@ def db_counts():
         print("db_counts() failed:", repr(e))
         return None, None
 
-
 # ---------- Main ----------
 def main():
     print("auto_refresh.py: entered main()", flush=True)
@@ -115,35 +115,62 @@ def main():
         print(f"DB before: {total_before} rows; last pulled_at: {last_pulled}")
 
     try:
-        print("Fetching solicitations from SAM.gov...", flush=True)
-        raw = gs.get_sam_raw_v3(
-            days_back=DAYS_BACK,
-            limit=50,   # you can tune this (lower=faster, higher=more thorough)
-            api_keys=SAM_KEYS,
-            filters={}
-        )
-        print(f"Fetched {len(raw)} raw records from SAM.gov")
+        print("Fetching solicitations from SAM.gov with pagination…", flush=True)
 
-        # Show sample records
-        for i, rec in enumerate(raw[:3]):
-            try:
-                m = gs.map_record_allowed_fields(rec, api_keys=SAM_KEYS, fetch_desc=False)
-                print(f" sample[{i}]: notice_id={m.get('notice_id')} title={m.get('title')!r}")
-            except Exception as e:
-                print(f" sample[{i}] map error:", repr(e))
+        total_fetched = 0
+        total_inserted = 0
+        offset = 0
+        page_idx = 0
 
-        n = insert_new_records_only(raw)
-        print(f"Inserted (attempted): {n}")
+        while total_fetched < MAX_RECORDS:
+            page_idx += 1
+            print(f"  → Page {page_idx}: offset={offset}, limit={PAGE_SIZE}", flush=True)
+
+            raw = gs.get_sam_raw_v3(
+                days_back=DAYS_BACK,
+                limit=PAGE_SIZE,
+                api_keys=SAM_KEYS,
+                filters={},
+                offset=offset,   # requires get_sam_raw_v3 to accept 'offset'
+            )
+
+            count = len(raw)
+            total_fetched += count
+            print(f"    fetched {count} records (cumulative fetched: {total_fetched})", flush=True)
+
+            if count == 0:
+                break
+
+            # Log a few IDs from the first pages to verify paging works
+            if page_idx <= 2:
+                try:
+                    sample_ids = [
+                        gs.map_record_allowed_fields(r, api_keys=SAM_KEYS, fetch_desc=False).get("notice_id")
+                        for r in raw[:5]
+                    ]
+                    print(f"    sample notice_ids: {sample_ids}")
+                except Exception as e:
+                    print("    sample logging failed:", repr(e))
+
+            inserted = insert_new_records_only(raw)
+            total_inserted += inserted
+            print(f"    inserted {inserted} new (cumulative inserted: {total_inserted})", flush=True)
+
+            if count < PAGE_SIZE:
+                # last page
+                break
+
+            offset += PAGE_SIZE
+
+        print(f"Done. Total fetched: {total_fetched}, total inserted: {total_inserted}", flush=True)
 
         total_after, last_pulled2 = db_counts()
         if total_after is not None:
             print(f"DB after: {total_after} rows; last pulled_at: {last_pulled2}")
 
-        if n == 0:
-            if len(raw) == 0:
-                print("DEBUG: SAM.gov returned 0 items.")
-            else:
-                print("DEBUG: All fetched items were duplicates or filtered out.")
+        if total_inserted == 0 and total_fetched == 0:
+            print("DEBUG: SAM.gov returned 0 items. Possible reasons: no new postings in window, "
+                  "too-narrow server-side filters, or upstream hiccup.")
 
         print("Auto-refresh job completed.")
 
@@ -159,7 +186,6 @@ def main():
     except Exception as e:
         print("Auto refresh failed:", repr(e))
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

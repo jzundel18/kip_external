@@ -1,32 +1,36 @@
-# app.py
-
-import os
-import re
-import json
+import os, re, json, bcrypt
 from typing import Optional, List, Dict, Any
-from sqlalchemy import inspect
-import pandas as pd
-import sqlalchemy as sa
-from sqlalchemy import text
-import streamlit as st
 from datetime import date, datetime, timezone
-from sqlmodel import SQLModel, Field, create_engine
+import pandas as pd
 import numpy as np
+import sqlalchemy as sa
+from sqlalchemy import text, inspect
+from sqlmodel import SQLModel, Field, create_engine
+import streamlit as st
 from openai import OpenAI
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import find_relevant_suppliers as fs
 import generate_proposal as gp
+import get_relevant_solicitations as gs
+SQLModel.metadata.clear()
 
 # =========================
 # Streamlit page
 # =========================
-st.set_page_config(page_title="GovContract Assistant MVP", layout="wide")
+st.set_page_config(page_title="KIP", layout="wide")
+
+# --- Simple view router ---
+# views: "auth", "main", "account"
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "profile" not in st.session_state:
+    st.session_state.profile = None
+if "view" not in st.session_state:
+    st.session_state.view = "main" if st.session_state.user else "auth"
 
 # =========================
 # Small helpers
 # =========================
+
 def normalize_naics_input(text_in: str) -> list[str]:
     if not text_in:
         return []
@@ -35,23 +39,6 @@ def normalize_naics_input(text_in: str) -> list[str]:
 
 def parse_keywords_or(text_in: str) -> list[str]:
     return [k.strip() for k in text_in.split(",") if k.strip()]
-
-# =========================
-# Password gate
-# =========================
-APP_PW = st.secrets.get("APP_PASSWORD", "")
-def gate():
-    if not APP_PW:
-        return True
-    if st.session_state.get("auth_ok"):
-        return True
-    pw = st.text_input("Enter access password", type="password")
-    if pw and pw.strip() == APP_PW.strip():
-        st.session_state.auth_ok = True
-        st.rerun()
-    st.stop()
-if not gate():
-    st.stop()
 
 # =========================
 # Secrets
@@ -137,7 +124,107 @@ class SolicitationRaw(SQLModel, table=True):
     description: Optional[str] = None
     link: Optional[str] = None
 
-# Create table
+class User(SQLModel, table=True):
+    __tablename__ = "users"
+    __table_args__ = {"extend_existing": True}   # <-- add this
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True, nullable=False)
+    password_hash: str = Field(nullable=False)
+    created_at: Optional[str] = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+class CompanyProfile(SQLModel, table=True):
+    __tablename__ = "company_profile"
+    __table_args__ = {"extend_existing": True}   # <-- add this
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, nullable=False)
+    company_name: str = Field(nullable=False)
+    description: str = Field(nullable=False)
+    city: Optional[str] = None
+    state: Optional[str] = None
+    created_at: Optional[str] = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: Optional[str] = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+# Lightweight migration: unique index on users.email and one-profile-per-user constraint
+try:
+    with engine.begin() as conn:
+        conn.execute(sa.text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON users (email);
+        """))
+        conn.execute(sa.text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_company_profile_user ON company_profile (user_id);
+        """))
+except Exception as e:
+    st.warning(f"User/profile table migration note: {e}")
+
+def _hash_password(pw: str) -> str:
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(pw.encode("utf-8"), salt).decode("utf-8")
+
+def _check_password(pw: str, pw_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+def get_user_by_email(email: str):
+    with engine.connect() as conn:
+        sql = sa.text("SELECT id, email, password_hash FROM users WHERE email = :e")
+        row = conn.execute(sql, {"e": email.strip().lower()}).mappings().first()
+        return dict(row) if row else None
+
+def create_user(email: str, password: str) -> Optional[int]:
+    email = email.strip().lower()
+    pw_hash = _hash_password(password)
+    with engine.begin() as conn:
+        try:
+            sql = sa.text("""
+                INSERT INTO users (email, password_hash, created_at)
+                VALUES (:email, :ph, :ts)
+                RETURNING id
+            """)
+            new_id = conn.execute(sql, {"email": email, "ph": pw_hash, "ts": datetime.utcnow().isoformat()}).scalar_one()
+            return int(new_id)
+        except Exception as e:
+            st.error(f"Could not create user: {e}")
+            return None
+
+def get_profile(user_id: int) -> Optional[dict]:
+    with engine.connect() as conn:
+        sql = sa.text("""
+            SELECT id, user_id, company_name, description, city, state, created_at, updated_at
+            FROM company_profile WHERE user_id = :uid
+        """)
+        row = conn.execute(sql, {"uid": user_id}).mappings().first()
+        return dict(row) if row else None
+
+def upsert_profile(user_id: int, company_name: str, description: str, city: str, state: str) -> None:
+    with engine.begin() as conn:
+        now = datetime.utcnow().isoformat()
+        # Try update first
+        upd = conn.execute(sa.text("""
+            UPDATE company_profile
+            SET company_name = :cn, description = :d, city = :c, state = :s, updated_at = :ts
+            WHERE user_id = :uid
+        """), {"cn": company_name, "d": description, "c": city, "s": state, "uid": user_id, "ts": now})
+        if upd.rowcount == 0:
+            conn.execute(sa.text("""
+                INSERT INTO company_profile (user_id, company_name, description, city, state, created_at, updated_at)
+                VALUES (:uid, :cn, :d, :c, :s, :ts, :ts)
+            """), {"uid": user_id, "cn": company_name, "d": description, "c": city, "s": state, "ts": now})
+
+# ---------------------------
+# Company directory (new table)
+# ---------------------------
+class Company(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    description: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = Field(default=None, index=True)
+
+# Create (or update) tables
 SQLModel.metadata.create_all(engine)
 
 # Lightweight migration: ensure columns & unique index
@@ -173,21 +260,6 @@ try:
 except Exception as e:
     st.warning(f"Migration note: {e}")
 
-# ---------------------------
-# Company directory (new table)
-# ---------------------------
-class Company(SQLModel, table=True):
-    __table_args__ = {"extend_existing": True}
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    name: str = Field(index=True)
-    description: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = Field(default=None, index=True)
-
-# Create (or update) tables
-SQLModel.metadata.create_all(engine)
-
 # Lightweight migration for Companies (safe if already exists)
 try:
     insp = inspect(engine)
@@ -207,10 +279,31 @@ try:
 except Exception as e:
     st.warning(f"Company table migration note: {e}")
 
+def render_sidebar_header():
+    """Sidebar header: company name, signed-in email, and settings button."""
+    with st.sidebar:
+        st.markdown("---")
+        if st.session_state.user:
+            prof = st.session_state.profile or {}
+            company_name = (prof.get("company_name") or "").strip() or "Your Company"
+            st.markdown(f"### {company_name}")
+            st.caption(f"Signed in as {st.session_state.user['email']}")
+            if st.button("⚙️ Account Settings", key="sb_go_settings", use_container_width=True):
+                st.session_state.view = "account"
+                st.rerun()
+        else:
+            st.info("Not signed in")
+            if st.button("Log in / Sign up", key="sb_go_login", use_container_width=True):
+                st.session_state.view = "auth"
+                st.rerun()
+        st.markdown("---")
+
 with st.sidebar:
     st.success("✅ API keys loaded from Secrets")
     st.caption("Feed refresh runs automatically (no manual refresh needed).")
     st.markdown("---")
+
+render_sidebar_header()
 
 # =========================
 # AI helpers
@@ -448,7 +541,6 @@ COLS_TO_SAVE = [
 ]
 
 DISPLAY_COLS = [
-    # For UI we will *exclude* notice_id and description, but they remain selectable below
     "pulled_at",
     "solicitation_number",
     "notice_type",
@@ -456,8 +548,7 @@ DISPLAY_COLS = [
     "response_date",
     "naics_code",
     "set_aside_code",
-    "link",
-    # (notice_id and description are intentionally not shown in UI, but exist in the DF).
+    "sam_url",   # swapped in for link
 ]
 
 def insert_new_records_only(records) -> int:
@@ -478,6 +569,8 @@ def insert_new_records_only(records) -> int:
             continue
         row = {k: (m.get(k) or "") for k in COLS_TO_SAVE}
         row["pulled_at"] = now_iso
+        # Normalize link to a human-facing URL
+        row["link"] = make_sam_public_url(row["notice_id"], row.get("link"))
         rows.append(row)
 
     if not rows:
@@ -570,16 +663,125 @@ def bulk_insert_companies(df: pd.DataFrame) -> int:
         insert_company_row(r)
     return len(rows)
 
+def render_auth_screen():
+    st.title("Welcome to KIP")
+    st.caption("Sign in or create an account to continue.")
 
+    c1, c2 = st.columns(2)
+
+    # ---- Login
+    with c1:
+        st.subheader("Log in")
+        le = st.text_input("Email", key="login_email_full")
+        lp = st.text_input("Password", type="password", key="login_password_full")
+        if st.button("Log in", key="btn_login_full", use_container_width=True):
+            u = get_user_by_email(le or "")
+            if not u:
+                st.error("No account found with that email.")
+            elif not _check_password(lp or "", u["password_hash"]):
+                st.error("Invalid password.")
+            else:
+                st.session_state.user = {"id": u["id"], "email": u["email"]}
+                st.session_state.profile = get_profile(u["id"])
+                st.session_state.view = "main"
+                st.success("Logged in.")
+                st.rerun()
+
+    # ---- Sign up
+    with c2:
+        st.subheader("Sign up")
+        se = st.text_input("Email", key="signup_email_full")
+        sp = st.text_input("Password", type="password", key="signup_password_full")
+        sp2 = st.text_input("Confirm password", type="password", key="signup_password2_full")
+        if st.button("Create account", key="btn_signup_full", type="primary", use_container_width=True):
+            if not se or not sp:
+                st.error("Email and password are required.")
+            elif sp != sp2:
+                st.error("Passwords do not match.")
+            elif get_user_by_email(se):
+                st.error("An account with that email already exists.")
+            else:
+                uid = create_user(se, sp)
+                if uid:
+                    # create an empty profile so settings page has something to edit
+                    upsert_profile(uid, company_name="", description="", city="", state="")
+                    st.success("Account created. Please log in on the left.")
+                else:
+                    st.error("Could not create account. Check server logs.")
+
+
+def render_account_settings():
+    st.title("Account Settings")
+
+    if st.session_state.user is None:
+        st.info("Please log in first.")
+        if st.button("Go to Login / Sign up"):
+            st.session_state.view = "auth"
+            st.rerun()
+        st.stop()
+
+    st.write(f"Signed in as **{st.session_state.user['email']}**")
+    if st.button("Sign out", key="btn_signout_settings"):
+        st.session_state.user = None
+        st.session_state.profile = None
+        st.session_state.view = "auth"
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("Company Profile")
+
+    prof = st.session_state.profile or {}
+    company_name = st.text_input("Company name", value=prof.get("company_name", ""))
+    description  = st.text_area("Company description", value=prof.get("description", ""), height=140)
+    city         = st.text_input("City", value=prof.get("city", "") or "")
+    state        = st.text_input("State", value=prof.get("state", "") or "")
+
+    cols = st.columns([1,1,3])
+    with cols[0]:
+        if st.button("Save profile", key="btn_save_profile_settings"):
+            if not company_name.strip() or not description.strip():
+                st.error("Company name and description are required.")
+            else:
+                upsert_profile(
+                    st.session_state.user["id"],
+                    company_name.strip(),
+                    description.strip(),
+                    city.strip(),
+                    state.strip()
+                )
+                st.session_state.profile = get_profile(st.session_state.user["id"])
+                st.success("Profile saved.")
+    with cols[1]:
+        if st.button("Back to app", key="btn_back_to_app"):
+            st.session_state.view = "main"
+            st.rerun()
 
 def _hide_notice_and_description(df: pd.DataFrame) -> pd.DataFrame:
     # UI should not show these two columns
-    return df.drop(columns=[c for c in ["notice_id", "description"] if c in df.columns], errors="ignore")
-# =========================
-# Header & top controls
-# =========================
-st.title("GovContract Assistant MVP")
-st.caption("Only storing required SAM fields; inserts brand-new notices only (no updates).")
+    return df.drop(columns=[c for c in ["notice_id", "description", "link"] if c in df.columns], errors="ignore")
+
+def make_sam_public_url(notice_id: str, link: str | None = None) -> str:
+    """
+    Return a human-viewable SAM.gov URL for this notice.
+    If the saved link is already a public web URL (not the API), keep it.
+    Otherwise build https://sam.gov/opp/<notice_id>/view
+    """
+    if link and isinstance(link, str) and "api.sam.gov" not in link:
+        return link
+    nid = (notice_id or "").strip()
+    return f"https://sam.gov/opp/{nid}/view" if nid else "https://sam.gov/"
+
+# ====== ROUTER ======
+if st.session_state.view == "auth":
+    render_auth_screen()
+    st.stop()
+elif st.session_state.view == "account":
+    render_account_settings()
+    st.stop()
+
+# ====== MAIN APP HEADER (only when in "main") ======
+st.title("KIP")
+st.caption("Don't be jealous that I've been chatting online with babes *all day*.")
 
 colR1, colR2 = st.columns([2,1])
 with colR1:
@@ -592,6 +794,7 @@ with colR2:
     except Exception:
         st.metric("Rows in DB", 0)
 
+
 # =========================
 # Session state
 # =========================
@@ -601,14 +804,14 @@ if "sup_df" not in st.session_state:
     st.session_state.sup_df = None
 
 # =========================
-# AI ranker (used for the Top 5 expander section)
+# AI ranker (used for the expander section)
 # =========================
 def ai_rank_solicitations_by_fit(
     df: pd.DataFrame,
     company_desc: str,
     api_key: str,
-    top_k: int = 5,
-    max_candidates: int = 100,
+    top_k: int = 10,
+    max_candidates: int = 1000,
     model: str = "gpt-4o-mini",
 ) -> list[dict]:
     if df is None or df.empty:
@@ -687,11 +890,12 @@ def ai_rank_solicitations_by_fit(
 # =========================
 # Tabs
 # =========================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1) Fetch Solicitations",
     "2) Supplier Suggestions",
     "3) Proposal Draft",
-    "4) Partner Matches"
+    "4) Partner Matches",
+    "5) Internal Use"
 ])
 # ---- Tab 1
 with tab1:
@@ -699,9 +903,9 @@ with tab1:
 
     colA, colB, colC = st.columns([1,1,1])
     with colA:
-        limit_results = st.number_input("Max results to show", min_value=1, max_value=5000, value=200)
+        limit_results = st.number_input("Max results to show", min_value=1, max_value=5000, value=20)
     with colB:
-        keywords_raw = st.text_input("Filter keywords (OR, comma-separated)", value="rfq, rfp, rfi")
+        keywords_raw = st.text_input("Filter keywords (OR, comma-separated)", value="")
     with colC:
         naics_raw = st.text_input("Filter by NAICS (comma-separated)", value="")
 
@@ -723,11 +927,28 @@ with tab1:
         "due_before": (due_before.isoformat() if isinstance(due_before, date) else None),
         "notice_types": notice_types,
     }
-    st.subheader("Company profile (optional)")
-    company_desc = st.text_area("Brief company description (for AI downselect)", value="", height=120)
-    st.session_state.company_desc = company_desc
+    st.subheader("Company profile for matching")
+    saved_desc = (st.session_state.get("profile") or {}).get("description", "")
+    use_saved = st.checkbox("Use saved company profile", value=bool(saved_desc))
+    if use_saved and saved_desc:
+        st.info("Using your saved company profile description.")
+        company_desc = saved_desc
+        # show as read-only preview
+        st.text_area("Company description (from Account → Company Profile)", value=saved_desc, height=120, disabled=True)
+    else:
+        company_desc = st.text_area("Brief company description (temporary)", value="", height=120)
+
+    st.session_state.company_desc = company_desc or ""
     use_ai_downselect = st.checkbox("Use AI to downselect based on description", value=False)
-    
+    # Let the user pick how many AI-ranked matches to return
+    top_k_select = (
+        st.number_input(
+            "How many AI-ranked matches?",
+            min_value=1, max_value=50, value=5, step=1,
+            help="How many solicitations the AI should rank and return."
+        )
+        if use_ai_downselect else 5
+)
     if st.button("Show top results", type="primary", key="btn_show_results"):
         try:
             # 1) Apply manual filters from DB (no SAM calls)
@@ -737,7 +958,7 @@ with tab1:
                 st.warning("No solicitations match your filters. Try adjusting filters or refresh today's feed.")
                 st.session_state.sol_df = None
             else:
-                # ===== IF AI downselect + company description → Rank Top 5 =====
+                # ===== IF AI downselect + company description → Rank Top N =====
                 if use_ai_downselect and company_desc.strip():
                     # Pre-trim with embeddings to keep prompt small & fast
                     # Keep the most-similar N items before LLM ranking
@@ -753,6 +974,14 @@ with tab1:
                         show_df["blurb"] = show_df["notice_id"].astype(str).map(blurbs).fillna(show_df["title"].fillna(""))
                         st.session_state.sol_df = show_df
                         st.subheader(f"Solicitations ({len(show_df)})")
+
+                        # Add normalized public SAM.gov URL
+                        show_df = show_df.copy()
+                        show_df["sam_url"] = show_df.apply(
+                            lambda r: make_sam_public_url(str(r.get("notice_id","")), r.get("link","")),
+                            axis=1
+                        )
+
                         st.dataframe(_hide_notice_and_description(show_df), use_container_width=True)
                         st.download_button(
                             "Download filtered as CSV",
@@ -761,16 +990,14 @@ with tab1:
                             mime="text/csv"
                         )
                     else:
-                        # Rank Top 5 with LLM (small prompt, capped candidates)
-                        with st.spinner("Ranking top matches with AI…"):
-                            ranked = ai_rank_solicitations_by_fit(
-                                df=pretrim,
-                                company_desc=company_desc.strip(),
-                                api_key=OPENAI_API_KEY,
-                                top_k=5,
-                                max_candidates=60,     # keep prompt compact → faster, cheaper
-                                model="gpt-4o-mini",
-                            )
+                        ranked = ai_rank_solicitations_by_fit(
+                        df=pretrim,
+                        company_desc=company_desc.strip(),
+                        api_key=OPENAI_API_KEY,
+                        top_k=int(top_k_select),
+                        max_candidates=60,
+                        model="gpt-4o-mini",
+)
 
                         if not ranked:
                             st.info("AI ranking returned no results; showing the manually filtered table instead.")
@@ -782,6 +1009,14 @@ with tab1:
                             show_df["blurb"] = show_df["notice_id"].astype(str).map(blurbs).fillna(show_df["title"].fillna(""))
                             st.session_state.sol_df = show_df
                             st.subheader(f"Solicitations ({len(show_df)})")
+
+                            # Add normalized public SAM.gov URL
+                            show_df = show_df.copy()
+                            show_df["sam_url"] = show_df.apply(
+                                lambda r: make_sam_public_url(str(r.get("notice_id","")), r.get("link","")),
+                                axis=1
+                            )
+
                             st.dataframe(_hide_notice_and_description(show_df), use_container_width=True)
                             st.download_button(
                                 "Download filtered as CSV",
@@ -790,18 +1025,18 @@ with tab1:
                                 mime="text/csv"
                             )
                         else:
-                            # Build ordered Top-5 dataframe
+                            # Build ordered dataframe
                             id_order = [x["notice_id"] for x in ranked]
                             preorder = {nid: i for i, nid in enumerate(id_order)}
                             top_df = pretrim[pretrim["notice_id"].astype(str).isin(id_order)].copy()
                             top_df["__order"] = top_df["notice_id"].astype(str).map(preorder)
                             top_df = top_df.sort_values("__order").drop(columns="__order")
 
-                            # Generate blurbs only for Top-5
+                            # Generate blurbs
                             blurbs = ai_make_blurbs(top_df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=10)
                             top_df["blurb"] = top_df["notice_id"].astype(str).map(blurbs).fillna(top_df["title"].fillna(""))
 
-                            # Show Top-5 as expanders: blurb first, click to see details
+                            # Show expanders: blurb first, click to see details
                             st.success(f"Top {len(top_df)} matches by company fit:")
                             # quick lookup for reasons and scores
                             reason_by_id = {x["notice_id"]: x.get("reason", "") for x in ranked}
@@ -818,28 +1053,24 @@ with tab1:
                                     st.write(f"**Response Due:** {getattr(row, 'response_date', '')}")
                                     st.write(f"**NAICS:** {getattr(row, 'naics_code', '')}")
                                     st.write(f"**Set-aside:** {getattr(row, 'set_aside_code', '')}")
-                                    link = getattr(row, "link", "")
-                                    if link:
-                                        st.write(f"**Link:** {link}")
+                                    link = make_sam_public_url(str(getattr(row, "notice_id", "")), getattr(row, "link", ""))
+                                    st.write(f"[Open on SAM.gov]({link})")
                                     reason = reason_by_id.get(str(getattr(row, "notice_id", "")), "")
                                     if reason:
                                         st.markdown("**Why this matched (AI):**")
                                         st.info(reason)
 
-                            # Save the Top-5 dataframe itself for Tab 4
-                            st.session_state.top5_df = top_df.reset_index(drop=True)
-                            # Remember for downstream tabs / downloads
+                            # Save the AI-ranked dataframe itself for Tab 4
+                            st.session_state.topn_df = top_df.reset_index(drop=True)
                             st.session_state.sol_df = top_df.copy()
                             # Invalidate any old partner matches (Tab 4 will auto-rebuild)
                             st.session_state.partner_matches = None
-                            st.session_state.top5_stamp = datetime.utcnow().isoformat()
-                            # Optional: let user download just the Top-5 rows
+                            st.session_state.topn_stamp = datetime.utcnow().isoformat()
                             st.download_button(
-                                "Download Top-5 (AI-ranked) as CSV",
-                                top_df.to_csv(index=False).encode("utf-8"),
-                                file_name="top5_ai_ranked.csv",
-                                mime="text/csv"
-                            )
+                            f"Download Top-{int(top_k_select)} (AI-ranked) as CSV",
+                            top_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"top{int(top_k_select)}_ai_ranked.csv",
+                            mime="text/csv")
 
                 # ===== NO AI → just show the filtered table with blurbs =====
                 else:
@@ -852,6 +1083,14 @@ with tab1:
 
                     st.session_state.sol_df = show_df
                     st.subheader(f"Solicitations ({len(show_df)})")
+
+                    # Add normalized public SAM.gov URL
+                    show_df = show_df.copy()
+                    show_df["sam_url"] = show_df.apply(
+                        lambda r: make_sam_public_url(str(r.get("notice_id","")), r.get("link","")),
+                        axis=1
+                    )
+
                     st.dataframe(_hide_notice_and_description(show_df), use_container_width=True)
                     st.download_button(
                         "Download filtered as CSV",
@@ -865,94 +1104,92 @@ with tab1:
 
 # ---- Tab 2
 with tab2:
-    st.header("Find Supplier Suggestions")
-    st.write("This uses your solicitation rows + Google results (via SerpAPI) to propose suppliers and rough quotes.")
-    our_rec = st.text_input("Favored suppliers (comma-separated)", value="")
-    our_not = st.text_input("Do-not-use suppliers (comma-separated)", value="")
-    max_google = st.number_input("Max Google results per item", min_value=1, max_value=20, value=5)
+    st.header("This feature is in development...")
+    # st.write("This uses your solicitation rows + Google results (via SerpAPI) to propose suppliers and rough quotes.")
+    # our_rec = st.text_input("Favored suppliers (comma-separated)", value="")
+    # our_not = st.text_input("Do-not-use suppliers (comma-separated)", value="")
+    # max_google = st.number_input("Max Google results per item", min_value=1, max_value=20, value=5)
 
-    if st.button("Run supplier suggestion", type="primary"):
-        if st.session_state.sol_df is None:
-            st.error("Load or fetch solicitations in Tab 1 first.")
-        else:
-            sol_dicts = st.session_state.sol_df.to_dict(orient="records")
-            favored = [x.strip() for x in our_rec.split(",") if x.strip()]
-            not_favored = [x.strip() for x in our_not.split(",") if x.strip()]
-            try:
-                results = fs.get_suppliers(
-                    solicitations=sol_dicts,
-                    our_recommended_suppliers=favored,
-                    our_not_recommended_suppliers=not_favored,
-                    Max_Google_Results=int(max_google),
-                    OpenAi_API_Key=OPENAI_API_KEY,
-                    Serp_API_Key=SERP_API_KEY
-                )
-                sup_df = pd.DataFrame(results)
-                st.session_state.sup_df = sup_df
-                st.success(f"Generated {len(sup_df)} supplier rows.")
-            except Exception as e:
-                st.exception(e)
+    # if st.button("Run supplier suggestion", type="primary"):
+    #     if st.session_state.sol_df is None:
+    #         st.error("Load or fetch solicitations in Tab 1 first.")
+    #     else:
+    #         sol_dicts = st.session_state.sol_df.to_dict(orient="records")
+    #         favored = [x.strip() for x in our_rec.split(",") if x.strip()]
+    #         not_favored = [x.strip() for x in our_not.split(",") if x.strip()]
+    #         try:
+    #             results = fs.get_suppliers(
+    #                 solicitations=sol_dicts,
+    #                 our_recommended_suppliers=favored,
+    #                 our_not_recommended_suppliers=not_favored,
+    #                 Max_Google_Results=int(max_google),
+    #                 OpenAi_API_Key=OPENAI_API_KEY,
+    #                 Serp_API_Key=SERP_API_KEY
+    #             )
+    #             sup_df = pd.DataFrame(results)
+    #             st.session_state.sup_df = sup_df
+    #             st.success(f"Generated {len(sup_df)} supplier rows.")
+    #         except Exception as e:
+    #             st.exception(e)
 
-    if st.session_state.sup_df is not None:
-        st.subheader("Supplier suggestions")
-        st.dataframe(st.session_state.sup_df, use_container_width=True)
-        st.download_button(
-            "Download as CSV",
-            st.session_state.sup_df.to_csv(index=False).encode("utf-8"),
-            file_name="supplier_suggestions.csv",
-            mime="text/csv"
-        )
+    # if st.session_state.sup_df is not None:
+    #     st.subheader("Supplier suggestions")
+    #     st.dataframe(st.session_state.sup_df, use_container_width=True)
+    #     st.download_button(
+    #         "Download as CSV",
+    #         st.session_state.sup_df.to_csv(index=False).encode("utf-8"),
+    #         file_name="supplier_suggestions.csv",
+    #         mime="text/csv"
+        # )
 
 # ---- Tab 3
 with tab3:
-    st.header("Generate Proposal Draft")
-    st.write("Select one or more supplier-suggestion rows and generate a proposal draft using your templates.")
-    bid_template = st.text_input("Bid template file path (DOCX or TXT)", value="/mnt/data/BID_TEMPLATE.docx")
-    solinfo_template = st.text_input("Solicitation info template (DOCX or TXT)", value="/mnt/data/SOLICITATION_INFO_TEMPLATE.docx")
-    out_dir = st.text_input("Output directory", value="/mnt/data/proposals")
+    st.header("This feature is in development...")
+    # st.write("Select one or more supplier-suggestion rows and generate a proposal draft using your templates.")
+    # bid_template = st.text_input("Bid template file path (DOCX or TXT)", value="/mnt/data/BID_TEMPLATE.docx")
+    # solinfo_template = st.text_input("Solicitation info template (DOCX or TXT)", value="/mnt/data/SOLICITATION_INFO_TEMPLATE.docx")
+    # out_dir = st.text_input("Output directory", value="/mnt/data/proposals")
 
-    uploaded_sup2 = st.file_uploader("Or upload supplier_suggestions.csv here", type=["csv"], key="sup_upload2")
-    if uploaded_sup2 is not None:
-        try:
-            df_upload = pd.read_csv(uploaded_sup2)
-            st.session_state.sup_df = df_upload
-            st.success(f"Loaded {len(df_upload)} supplier suggestions from upload.")
-        except Exception as e:
-            st.error(f"Failed to read CSV: {e}")
+    # uploaded_sup2 = st.file_uploader("Or upload supplier_suggestions.csv here", type=["csv"], key="sup_upload2")
+    # if uploaded_sup2 is not None:
+    #     try:
+    #         df_upload = pd.read_csv(uploaded_sup2)
+    #         st.session_state.sup_df = df_upload
+    #         st.success(f"Loaded {len(df_upload)} supplier suggestions from upload.")
+    #     except Exception as e:
+    #         st.error(f"Failed to read CSV: {e}")
 
-    if st.session_state.sup_df is not None:
-        st.dataframe(st.session_state.sup_df, use_container_width=True)
-        idxs = st.multiselect(
-            "Pick rows to draft",
-            options=list(range(len(st.session_state.sup_df))),
-            help="Leave empty to draft all"
-        )
-        if st.button("Generate proposal(s)", type="primary"):
-            os.makedirs(out_dir, exist_ok=True)
-            try:
-                df_sel = st.session_state.sup_df.iloc[idxs] if idxs else st.session_state.sup_df
-                gp.validate_supplier_and_write_proposal(
-                    df=df_sel,
-                    output_directory=out_dir,
-                    Open_AI_API_Key=OPENAI_API_KEY,
-                    BID_TEMPLATE_FILE=bid_template,
-                    SOl_INFO_TEMPLATE=solinfo_template
-                )
-                st.success(f"Drafted proposals to {out_dir}.")
-            except Exception as e:
-                st.exception(e)
+    # if st.session_state.sup_df is not None:
+    #     st.dataframe(st.session_state.sup_df, use_container_width=True)
+    #     idxs = st.multiselect(
+    #         "Pick rows to draft",
+    #         options=list(range(len(st.session_state.sup_df))),
+    #         help="Leave empty to draft all"
+    #     )
+    #     if st.button("Generate proposal(s)", type="primary"):
+    #         os.makedirs(out_dir, exist_ok=True)
+    #         try:
+    #             df_sel = st.session_state.sup_df.iloc[idxs] if idxs else st.session_state.sup_df
+    #             gp.validate_supplier_and_write_proposal(
+    #                 df=df_sel,
+    #                 output_directory=out_dir,
+    #                 Open_AI_API_Key=OPENAI_API_KEY,
+    #                 BID_TEMPLATE_FILE=bid_template,
+    #                 SOl_INFO_TEMPLATE=solinfo_template
+    #             )
+    #             st.success(f"Drafted proposals to {out_dir}.")
+    #         except Exception as e:
+    #             st.exception(e)
 # ---- Tab 4
 with tab4:
-    st.header("Partner Matches (from Top-5)")
+    st.header("Partner Matches (from AI-ranked results)")
 
-    # Load companies from DB (read-only; no manage UI)
+    # Need AI-ranked results from Tab 1
+    topn = st.session_state.get("topn_df")
     df_companies = companies_df()
 
-    # Need Top-5 from Tab 1
-    top5 = st.session_state.get("top5_df")
-
-    if top5 is None or top5.empty:
-        st.info("No Top-5 available. In Tab 1, run AI ranking to generate Top-5 first.")
+    if topn is None or topn.empty:
+        st.info("No AI-ranked results available. In Tab 1, run AI ranking to generate matches first.")
     elif df_companies.empty:
         st.info("Your company database is empty. Populate the 'company' table in Supabase with: name, description, city, state.")
     else:
@@ -961,16 +1198,16 @@ with tab4:
         if not company_desc_global:
             st.info("No company description provided in Tab 1. Please enter one there and rerun.")
         else:
-            # Auto-compute matches when Top-5 changes or cache is empty
+            # Auto-compute matches when Top-n changes or cache is empty
             need_recompute = (
                 st.session_state.get("partner_matches") is None or
-                st.session_state.get("partner_matches_stamp") != st.session_state.get("top5_stamp")
+                st.session_state.get("partner_matches_stamp") != st.session_state.get("topn_stamp")
             )
 
             if need_recompute:
-                with st.spinner("Analyzing gaps and selecting partners for Top-5…"):
+                with st.spinner("Analyzing gaps and selecting partners..."):
                     matches = []
-                    for _, row in top5.head(5).iterrows():
+                    for _, row in topn.iterrows():
                         title = str(row.get("title", "")) or "Untitled"
                         blurb = str(row.get("blurb", "")).strip()
                         desc  = str(row.get("description", "")) or ""
@@ -1004,9 +1241,9 @@ with tab4:
                             "ai": ai
                         })
 
-                # Cache results with a stamp tied to the Top-5
+                # Cache results with a stamp tied to the Top-n
                 st.session_state.partner_matches = matches
-                st.session_state.partner_matches_stamp = st.session_state.get("top5_stamp")
+                st.session_state.partner_matches_stamp = st.session_state.get("topn_stamp")
 
             # Render cached matches
             matches = st.session_state.get("partner_matches", [])
@@ -1046,5 +1283,150 @@ with tab4:
                         if jp:
                             st.markdown("**Targeted joint proposal idea:**")
                             st.write(jp)
+
+# ---- Tab 5
+with tab5:
+    st.header("Internal Use")
+
+    st.caption(
+        "Quick presets that filter/rank solicitations with AI. "
+        "Results appear below in relevance order with short blurbs."
+    )
+
+    # let internal users choose how many AI-ranked results they want
+    internal_top_k = st.number_input(
+        "How many AI-ranked matches?",
+        min_value=1, max_value=50, value=5, step=1
+    )
+
+    # optionally let them cap how many DB rows to consider before AI (keeps it fast)
+    max_candidates_cap = st.number_input(
+        "Max candidates to consider before AI ranking",
+        min_value=20, max_value=1000, value=300, step=20,
+        help="We first pre-trim with embeddings, then rank with the LLM."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        run_machine_shop = st.button("Solicitations for Machine Shop", type="primary", use_container_width=True)
+    with c2:
+        run_services = st.button("Solicitations for Services", type="primary", use_container_width=True)
+
+    # Helper to run preset search
+    def _run_internal_preset(preset_desc: str, negative_hint: str = ""):
+        try:
+            # pull everything; we'll let AI do the heavy lifting
+            df_all = query_filtered_df({
+                "keywords_or": [],
+                "naics": [],
+                "set_asides": [],
+                "due_before": None,
+                "notice_types": [],   # consider all notice types you already allow
+            })
+
+            if df_all.empty:
+                st.warning("No solicitations in the database to evaluate.")
+                return
+
+            # Compose an internal-use company description that biases AI correctly
+            # We also inject a small "negative_hint" to push the filter to avoid non-fits.
+            company_desc_internal = preset_desc.strip()
+            if negative_hint.strip():
+                company_desc_internal += f"\n\nDo NOT include non-fits: {negative_hint.strip()}"
+
+            # Pre-trim with embeddings to keep the LLM prompt small/cheap
+            pretrim_cap = min(int(max_candidates_cap), max(20, 12 * int(internal_top_k)))
+            pretrim = ai_downselect_df(company_desc_internal, df_all, OPENAI_API_KEY, top_k=pretrim_cap)
+
+            if pretrim.empty:
+                st.info("AI pre-filter returned nothing.")
+                return
+
+            # Rank with the LLM
+            ranked = ai_rank_solicitations_by_fit(
+                df=pretrim,
+                company_desc=company_desc_internal,
+                api_key=OPENAI_API_KEY,
+                top_k=int(internal_top_k),
+                max_candidates=min(len(pretrim), 60),  # keep the ranking prompt tight
+                model="gpt-4o-mini",
+            )
+
+            if not ranked:
+                st.info("AI ranking returned no results.")
+                return
+
+            # Order the dataframe per the ranked list
+            id_order = [x["notice_id"] for x in ranked]
+            preorder = {nid: i for i, nid in enumerate(id_order)}
+            top_df = pretrim[pretrim["notice_id"].astype(str).isin(id_order)].copy()
+            top_df["__order"] = top_df["notice_id"].astype(str).map(preorder)
+            top_df = top_df.sort_values("__order").drop(columns="__order")
+
+            # Generate short blurbs for what we're showing
+            blurbs = ai_make_blurbs(top_df, OPENAI_API_KEY, model="gpt-4o-mini", max_items=int(len(top_df)))
+            top_df["blurb"] = top_df["notice_id"].astype(str).map(blurbs).fillna(top_df["title"].fillna(""))
+
+            # quick lookup for reasons and scores
+            reason_by_id = {x["notice_id"]: x.get("reason", "") for x in ranked}
+            score_by_id  = {x["notice_id"]: x.get("score", 0)  for x in ranked}
+            top_df["fit_score"] = top_df["notice_id"].astype(str).map(score_by_id).fillna(0).astype(float)
+
+            st.success(f"Top {len(top_df)} matches by relevance:")
+            for i, row in enumerate(top_df.itertuples(index=False), start=1):
+                hdr = (getattr(row, "blurb", None) or getattr(row, "title", None) or "Untitled")
+                with st.expander(f"{i}. {hdr}"):
+                    st.write(f"**Notice Type:** {getattr(row, 'notice_type', '')}")
+                    st.write(f"**Posted:** {getattr(row, 'posted_date', '')}")
+                    st.write(f"**Response Due:** {getattr(row, 'response_date', '')}")
+                    st.write(f"**NAICS:** {getattr(row, 'naics_code', '')}")
+                    st.write(f"**Set-aside:** {getattr(row, 'set_aside_code', '')}")
+                    link = make_sam_public_url(str(getattr(row, 'notice_id', '')), getattr(row, 'link', ''))
+                    st.write(f"[Open on SAM.gov]({link})")
+                    reason = reason_by_id.get(str(getattr(row, "notice_id", "")), "")
+                    if reason:
+                        st.markdown("**Why this matched (AI):**")
+                        st.info(reason)
+
+            # Make these results available to the Supplier Suggestions tab if desired
+            st.session_state.sol_df = top_df.copy()
+
+            # Offer a download
+            st.download_button(
+                f"Download Internal Use Results (Top-{int(internal_top_k)})",
+                top_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"internal_top{int(internal_top_k)}.csv",
+                mime="text/csv"
+            )
+
+        except Exception as e:
+            st.exception(e)
+
+    # Run the chosen preset
+    if run_machine_shop:
+        preset_desc = (
+            "We are pursuing solicitations where a MACHINE SHOP would fabricate or machine parts for us. "
+            "Strong fits include CNC machining, milling, turning, drilling, precision tolerances, "
+            "metal or plastic fabrication, weldments, assemblies, and production of custom components per drawings. "
+            "Prefer solicitations with part drawings, specs, materials (e.g., aluminum, steel, titanium), "
+            "and tangible manufactured items."
+        )
+        negative_hint = (
+            "Pure services, staffing-only, software-only, consulting, training, janitorial, IT, "
+            "or anything that does not involve fabricating or machining a physical part."
+        )
+        _run_internal_preset(preset_desc, negative_hint)
+
+    if run_services:
+        preset_desc = (
+            "We are pursuing solicitations where a SERVICES COMPANY performs the work for us. "
+            "Strong fits include maintenance, installation, inspection, logistics, training, field services, "
+            "operations support, professional services, and other labor-based or outcome-based services "
+            "delivered under SOW/Performance Work Statement."
+        )
+        negative_hint = (
+            "Manufacturing-only or pure product buys without a material services component."
+        )
+        _run_internal_preset(preset_desc, negative_hint)
 st.markdown("---")
 st.caption("DB schema is fixed to only the required SAM fields. Refresh inserts brand-new notices only (no updates).")
